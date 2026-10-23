@@ -198,17 +198,18 @@ impl TuiArenaApp {
         self.total_xdp_drop = 0;
         self.step_tick = 0;
 
-        let names = ["node-alpha", "node-beta", "node-gamma"];
+        let names = ["node-alpha", "node-beta", "node-gamma", "node-delta"];
         let mut pub_keys = BTreeMap::new();
 
         for (i, &name) in names.iter().enumerate() {
             let seed = [(i as u8) + 1; 32];
             let id = NodeCryptoIdentity::from_seed(name, &seed);
             pub_keys.insert(name.to_string(), id.public_key_bytes.clone());
-            self.identities.insert(name.to_string(), id);
+            self.identities
+                .insert(name.to_string(), NodeCryptoIdentity::from_seed(name, &seed));
         }
 
-        for &name in &names {
+        for (i, &name) in names.iter().enumerate() {
             let peers: Vec<String> = names
                 .iter()
                 .filter(|&&n| n != name)
@@ -217,7 +218,9 @@ impl TuiArenaApp {
             let bridge = Arc::new(MockEbpfBridge::new_with_secret(vec![
                 0xAA, 0xBB, 0xCC, 0xDD,
             ]));
+            let seed = [(i as u8) + 1; 32];
             let mut st = ConsensusState::new(name, peers).with_ebpf_bridge(bridge.clone());
+            st.set_crypto_identity(NodeCryptoIdentity::from_seed(name, &seed));
             st.register_peer_public_keys(pub_keys.clone());
             self.bridges.insert(name.to_string(), bridge);
             self.nodes.insert(name.to_string(), st);
@@ -269,8 +272,10 @@ impl TuiArenaApp {
         }
 
         let term = self.nodes[candidate].current_term;
+        let quorum = self.nodes[candidate].quorum_size();
+        let total = self.nodes[candidate].cluster_size();
         self.log(format!(
-            "ELECTED: `{candidate}` won Quorum (3/3) in Term {term} via Ed25519 Signed RequestVote"
+            "ELECTED: `{candidate}` won BFT Quorum (>={quorum}/{total}) in Term {term} via Ed25519 Signed RequestVote"
         ));
     }
 
@@ -383,21 +388,29 @@ impl TuiArenaApp {
                 }
             }
 
-            // (C) 実 Linux カーネル eBPF ブリッジが接続されている場合は、カーネル内の実 `PEER_POLICY_MAP` にも即時書き込む！
+            // (C) コンセンサス合意が成立して commit_index が進んだ場合のみ、実 Linux カーネル eBPF ブリッジにも同期する
+            let leader_commit = self.nodes[&leader_id].commit_index;
+            let qc_sigs = self.nodes[&leader_id]
+                .commit_qcs
+                .get(&leader_commit)
+                .map(|qc| qc.signatures.len())
+                .unwrap_or(0);
+            let cluster_total = self.nodes[&leader_id].cluster_size();
+
             if let Some(ref real_bridge) = self.real_kernel_bridge {
-                let policy =
-                    veil_common::PeerPolicy::new(false, self.nodes[&leader_id].commit_index as u32);
-                let _ = real_bridge.sync_peer_policy(u32::from(ip), policy);
-                self.log(format!(
-                    "SYSCALL BPF: sys_bpf(BPF_MAP_UPDATE_ELEM, map=PEER_POLICY_MAP, key={ip}, trusted=0) -> XDP_DROP active!"
-                ));
+                if let Some(&policy) = self.nodes[&leader_id].ebpf_policy_map.get(&u32::from(ip)) {
+                    let _ = real_bridge.sync_peer_policy(u32::from(ip), policy);
+                    self.log(format!(
+                        "SYSCALL BPF: sys_bpf(BPF_MAP_UPDATE_ELEM, map=PEER_POLICY_MAP, key={ip}, trusted=0) -> XDP_DROP active!"
+                    ));
+                }
             }
 
             // (D) OS 上のモック攻撃プロセスに実際に sys_kill(PID, SIGKILL) を発行し、wait4() で回収した証拠をログに記録
             let kill_proof = self.rogues[idx].kill_process();
             self.log(format!("SYSCALL KILL: {kill_proof}"));
             self.log(format!(
-                "EXTERMINATED PID={pid} ({ip}): Quorum(3/3) -> XDP_DROP + LSM -EPERM + Stealth GC Zeroized + SIGKILL!"
+                "EXTERMINATED PID={pid} ({ip}): QC({qc_sigs}/{cluster_total} Ed25519 sigs) -> XDP_DROP + LSM Sim + SIGKILL!"
             ));
         }
     }

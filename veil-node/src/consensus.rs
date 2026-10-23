@@ -10,6 +10,15 @@ use veil_common::{
 
 pub type NodeId = String;
 
+/// `u64::MAX` による Term 飽和（インクリメント不能・DoS）を防ぐための安全な Term 上限値
+pub const MAX_SAFE_TERM: u64 = u64::MAX / 2;
+
+/// 1回の `AppendEntries` RPC に含められる最大ログエントリ数（メモリ枯渇 DoS 防止）
+pub const MAX_LOG_ENTRIES_PER_RPC: usize = 1024;
+
+/// QUIC ストリーム上で許容する最大メッセージサイズ（64 KiB）
+pub const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// メッシュネットワーク内で合意対象となるコマンド（eBPF XDP 遮断ポリシー & LSM ステルス GC 制御）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MeshCommand {
@@ -69,20 +78,22 @@ pub enum ConsensusRpc {
         prev_log_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
-        /// リーダー自身の裏切り・二枚舌（Equivocation）を封じるマルチシグ合意証明書（Quorum Certificate）
+        /// リーダー単独のコミット捏造および二枚舌（Equivocation）を封じる必須マルチシグ合意証明書（Quorum Certificate）
         commit_qc: Option<QuorumCertificate>,
     },
-    /// ログ複製への応答（合意されたエントリの暗号ダイジェスト付き）
+    /// ログ複製への応答（合意されたエントリの暗号ダイジェスト + QC 用 Ed25519 投票署名付き）
     AppendEntriesResponse {
         term: u64,
         follower_id: NodeId,
         success: bool,
         match_index: u64,
         entry_hash: [u8; 32],
+        /// フォロワーが `(term, match_index, entry_hash)` に対して署名した Ed25519 QC 投票署名
+        qc_vote_signature: Vec<u8>,
     },
 }
 
-/// 過半数（または $2f+1$）の独立したノードが「同一の `(term, index, entry_hash)` に署名した」ことを証明する
+/// $2f+1$（BFT 定足数）の独立したノードが「同一の `(term, index, entry_hash)` に署名した」ことを証明する
 /// 改ざん不可能なマルチシグ合意証明書（Quorum Certificate: QC）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumCertificate {
@@ -105,13 +116,25 @@ impl LogEntry {
     }
 }
 
-/// QC 署名対象のバイト列 `(term, index, entry_hash)` を構築する
+/// QC 署名対象のバイト列 `(term, index, entry_hash)` を構築する（ドメイン分離プレフィックス付き）
 pub fn qc_vote_payload(term: u64, index: u64, entry_hash: &[u8; 32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8 + 8 + 32);
+    let mut buf = Vec::with_capacity(16 + 8 + 8 + 32);
+    buf.extend_from_slice(b"VEIL_QC_VOTE_V1:");
     buf.extend_from_slice(&term.to_be_bytes());
     buf.extend_from_slice(&index.to_be_bytes());
     buf.extend_from_slice(entry_hash);
     buf
+}
+
+/// ノード ID から決定論的な 32 バイト Ed25519 シードを導出する（テストおよびデフォルト識別子用）
+pub fn derive_default_node_seed(node_id: &str) -> [u8; 32] {
+    use ring::digest;
+    let mut input = Vec::from(&b"VEIL_MESH_NODE_DEFAULT_SEED_V1:"[..]);
+    input.extend_from_slice(node_id.as_bytes());
+    let digest = digest::digest(&digest::SHA256, &input);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(digest.as_ref());
+    seed
 }
 
 impl ConsensusRpc {
@@ -122,6 +145,16 @@ impl ConsensusRpc {
             ConsensusRpc::RequestVoteResponse { voter_id, .. } => voter_id,
             ConsensusRpc::AppendEntries { leader_id, .. } => leader_id,
             ConsensusRpc::AppendEntriesResponse { follower_id, .. } => follower_id,
+        }
+    }
+
+    /// RPC メッセージに含まれる Term 値を取得する
+    pub fn term(&self) -> u64 {
+        match self {
+            ConsensusRpc::RequestVote { term, .. }
+            | ConsensusRpc::RequestVoteResponse { term, .. }
+            | ConsensusRpc::AppendEntries { term, .. }
+            | ConsensusRpc::AppendEntriesResponse { term, .. } => *term,
         }
     }
 }
@@ -142,7 +175,7 @@ pub struct NodeCryptoIdentity {
 }
 
 impl NodeCryptoIdentity {
-    /// 決定論的シード（32バイト）または乱数から Ed25519 鍵ペアを生成する
+    /// 決定論的シード（32バイト）から Ed25519 鍵ペアを生成する
     pub fn from_seed(node_id: impl Into<String>, seed: &[u8; 32]) -> Self {
         let keypair =
             Ed25519KeyPair::from_seed_unchecked(seed).expect("valid 32-byte Ed25519 seed");
@@ -152,6 +185,13 @@ impl NodeCryptoIdentity {
             keypair,
             public_key_bytes,
         }
+    }
+
+    /// ノード ID からデフォルトの決定論的鍵ペアを生成する
+    pub fn default_for_node(node_id: impl Into<String>) -> Self {
+        let id = node_id.into();
+        let seed = derive_default_node_seed(&id);
+        Self::from_seed(id, &seed)
     }
 
     /// `ConsensusRpc` をシリアライズして Ed25519 署名を付与する
@@ -180,7 +220,7 @@ pub enum Role {
     Leader,
 }
 
-/// 決定論的コンセンサス・ステートマシン（Raft + Ed25519 BFT 署名検証 + eBPF ブリッジ同期）
+/// 決定論的コンセンサス・ステートマシン（Ed25519 署名付き RPC + マルチシグ QC 必須化 + eBPF ブリッジ同期）
 pub struct ConsensusState {
     pub node_id: NodeId,
     pub peers: Vec<NodeId>,
@@ -199,6 +239,12 @@ pub struct ConsensusState {
     pub next_index: BTreeMap<NodeId, u64>,
     pub match_index: BTreeMap<NodeId, u64>,
 
+    /// 各ログ Index ごとに収集された検証済み Ed25519 QC 署名 (`log_index -> (voter_id -> signature)`)
+    pub qc_votes: BTreeMap<u64, BTreeMap<NodeId, Vec<u8>>>,
+
+    /// コミット確定時に生成された各ログ Index のマルチシグ合意証明書 (`log_index -> QuorumCertificate`)
+    pub commit_qcs: BTreeMap<u64, QuorumCertificate>,
+
     /// 確定（Commit & Apply）したコンセンサス結果から同期される eBPF `PEER_POLICY_MAP` のミラー状態
     pub ebpf_policy_map: BTreeMap<u32, PeerPolicy>,
 
@@ -208,10 +254,13 @@ pub struct ConsensusState {
     /// カーネル内の実 Aya eBPF マップ（またはテスト用 MockEbpfBridge）へのリアルタイム書き込みブリッジ
     pub ebpf_bridge: Option<Arc<dyn EbpfBridge>>,
 
+    /// 自ノードの Ed25519 署名鍵アイデンティティ
+    pub identity: Arc<NodeCryptoIdentity>,
+
     /// ビザンチン耐性（Ed25519 署名検証）用の信頼済みピア公開鍵レジストリ (`NodeId -> 32-byte Ed25519 PublicKey`)
     pub peer_public_keys: BTreeMap<NodeId, Vec<u8>>,
 
-    /// 署名不正やなりすましにより棄却されたビザンチンパケットのカウンタ
+    /// 署名不正・なりすまし・二枚舌・QC 欠落・境界値違反により棄却されたパケットのカウンタ
     pub rejected_byzantine_packets: u64,
 }
 
@@ -235,8 +284,17 @@ impl std::fmt::Debug for ConsensusState {
 
 impl ConsensusState {
     pub fn new(node_id: impl Into<String>, peers: Vec<NodeId>) -> Self {
+        let id_str = node_id.into();
+        let identity = Arc::new(NodeCryptoIdentity::default_for_node(&id_str));
+        let mut peer_public_keys = BTreeMap::new();
+        peer_public_keys.insert(id_str.clone(), identity.public_key_bytes.clone());
+        for peer in &peers {
+            let peer_id = NodeCryptoIdentity::default_for_node(peer);
+            peer_public_keys.insert(peer.clone(), peer_id.public_key_bytes);
+        }
+
         Self {
-            node_id: node_id.into(),
+            node_id: id_str,
             peers,
             current_term: 0,
             voted_for: None,
@@ -248,10 +306,13 @@ impl ConsensusState {
             votes_received: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            qc_votes: BTreeMap::new(),
+            commit_qcs: BTreeMap::new(),
             ebpf_policy_map: BTreeMap::new(),
             lsm_policy: NodeLsmPolicy::new(false, 0),
             ebpf_bridge: None,
-            peer_public_keys: BTreeMap::new(),
+            identity,
+            peer_public_keys,
             rejected_byzantine_packets: 0,
         }
     }
@@ -262,14 +323,27 @@ impl ConsensusState {
         self
     }
 
+    /// カスタムの Ed25519 鍵アイデンティティを設定する
+    pub fn set_crypto_identity(&mut self, identity: NodeCryptoIdentity) {
+        self.peer_public_keys
+            .insert(identity.node_id.clone(), identity.public_key_bytes.clone());
+        self.identity = Arc::new(identity);
+    }
+
     /// 信頼済みノードの Ed25519 公開鍵群を登録する
     pub fn register_peer_public_keys(&mut self, keys: BTreeMap<NodeId, Vec<u8>>) {
         self.peer_public_keys = keys;
     }
 
-    /// ビザンチン耐性検証付き RPC ハンドラ：
+    /// 自ノードの秘密鍵で `ConsensusRpc` に Ed25519 署名を付与する
+    pub fn sign_rpc(&self, rpc: ConsensusRpc) -> SignedConsensusRpc {
+        self.identity.sign_rpc(rpc)
+    }
+
+    /// ビザンチン耐性検証付き RPC ハンドラ（唯一の外部 RPC 入口）：
     /// 1. `signer_id` と RPC 内部の主張送信者 (`sender_id()`) が一致することを確認（なりすまし防止）
     /// 2. `peer_public_keys` に登録された公開鍵で Ed25519 署名を検証（改ざん・偽造防止）
+    /// 3. Term の上限・0 チェックによるオーバーフロー / 飽和攻撃の遮断
     pub fn handle_signed_rpc(
         &mut self,
         signed: SignedConsensusRpc,
@@ -293,6 +367,10 @@ impl ConsensusState {
 
         // 3. Ed25519 署名の暗号学的検証
         let payload = bincode::serialize(&signed.rpc).map_err(|_| "Serialization error")?;
+        if payload.len() > MAX_WIRE_MESSAGE_BYTES {
+            self.rejected_byzantine_packets += 1;
+            return Err("Byzantine Fault Detected: RPC payload exceeds MAX_WIRE_MESSAGE_BYTES");
+        }
         let peer_pub_key = UnparsedPublicKey::new(&signature::ED25519, pub_key_bytes);
         if peer_pub_key.verify(&payload, &signed.signature).is_err() {
             self.rejected_byzantine_packets += 1;
@@ -301,7 +379,16 @@ impl ConsensusState {
             );
         }
 
-        Ok(self.handle_rpc(signed.rpc))
+        // 4. Term 境界値チェック（term == 0 または term > MAX_SAFE_TERM の異常値を拒否）
+        let rpc_term = signed.rpc.term();
+        if rpc_term == 0 || rpc_term > MAX_SAFE_TERM {
+            self.rejected_byzantine_packets += 1;
+            return Err(
+                "Byzantine Fault Detected: RPC term out of safe bounds (0 or > MAX_SAFE_TERM)",
+            );
+        }
+
+        Ok(self.process_verified_rpc(signed.rpc))
     }
 
     /// クラスタの総ノード数（自身 + ピア）
@@ -309,9 +396,11 @@ impl ConsensusState {
         self.peers.len() + 1
     }
 
-    /// 過半数（Quorum）に必要なノード数: $\lfloor N / 2 \rfloor + 1$
+    /// BFT 定足数（Quorum）に必要なノード数: $\lfloor 2N / 3 \rfloor + 1$
+    /// - $N = 4$ ($3f+1, f=1$) のとき $2f+1 = 3$ 台の署名が必要
+    /// - 任意の2つの Quorum ($3$ 台) は最低 $2$ 台で交差し、少なくとも $1$ 台の誠実なノードを含む
     pub fn quorum_size(&self) -> usize {
-        (self.cluster_size() / 2) + 1
+        (2 * self.cluster_size()) / 3 + 1
     }
 
     pub fn last_log_index(&self) -> u64 {
@@ -334,7 +423,9 @@ impl ConsensusState {
 
     /// 選挙タイムアウト発火時：新しい Term へ遷移し Candidate となって投票要求を生成する
     pub fn start_election(&mut self) -> ConsensusRpc {
-        self.current_term += 1;
+        if self.current_term < MAX_SAFE_TERM {
+            self.current_term += 1;
+        }
         self.role = Role::Candidate;
         self.voted_for = Some(self.node_id.clone());
         self.leader_id = None;
@@ -351,6 +442,12 @@ impl ConsensusState {
             last_log_index: self.last_log_index(),
             last_log_term: self.last_log_term(),
         }
+    }
+
+    /// 選挙を開始し、Ed25519 署名付きの `RequestVote` RPC を返す
+    pub fn start_signed_election(&mut self) -> SignedConsensusRpc {
+        let rv = self.start_election();
+        self.sign_rpc(rv)
     }
 
     fn become_leader(&mut self) {
@@ -372,7 +469,7 @@ impl ConsensusState {
         self.votes_received.clear();
     }
 
-    /// リーダーとして新しいコマンドを提案しログへ追加する
+    /// リーダーとして新しいコマンドを提案し、自身の Ed25519 QC 投票署名を記録してログへ追加する
     pub fn propose(&mut self, command: MeshCommand) -> Result<LogEntry, &'static str> {
         if self.role != Role::Leader {
             return Err("Only leader can propose commands");
@@ -383,13 +480,19 @@ impl ConsensusState {
             index,
             command,
         };
+        let digest = entry.digest();
+        let my_qc_sig = self.identity.sign_qc_vote(entry.term, index, &digest);
         self.log.push(entry.clone());
+        self.qc_votes
+            .entry(index)
+            .or_default()
+            .insert(self.node_id.clone(), my_qc_sig);
 
         self.advance_commit_index();
         Ok(entry)
     }
 
-    /// 特定のフォロワーへ送信すべき `AppendEntries` RPC を構築する
+    /// 特定のフォロワーへ送信すべき `AppendEntries` RPC を構築する（最新の `QuorumCertificate` 付き）
     pub fn make_append_entries(&self, peer_id: &str) -> Option<ConsensusRpc> {
         if self.role != Role::Leader {
             return None;
@@ -404,6 +507,12 @@ impl ConsensusState {
             Vec::new()
         };
 
+        let commit_qc = if self.commit_index > 0 {
+            self.commit_qcs.get(&self.commit_index).cloned()
+        } else {
+            None
+        };
+
         Some(ConsensusRpc::AppendEntries {
             term: self.current_term,
             leader_id: self.node_id.clone(),
@@ -411,27 +520,40 @@ impl ConsensusState {
             prev_log_term,
             entries,
             leader_commit: self.commit_index,
-            commit_qc: None,
+            commit_qc,
         })
     }
 
     /// マルチシグ合意証明書（Quorum Certificate: QC）および二枚舌（Equivocation）の厳密検証：
-    /// 1. リーダーが同じ `(term, index)` で異なる `entry_hash` を送ってきた場合（二枚舌攻撃）、即座に検知して拒否する
-    /// 2. `QuorumCertificate` に含まれる異なるノードからの Ed25519 署名が過半数（または $2f+1$）以上あり、
+    /// 1. `qc.index` が有効範囲 (`1..=last_log_index`) にあり、自身の該当ログエントリと `term` および `entry_hash` が完全一致することを確認
+    /// 2. `QuorumCertificate` に含まれる異なる信頼済みノードからの Ed25519 署名が BFT 定足数（`quorum_size()` = $\lfloor 2N/3 \rfloor + 1$）以上あり、
     ///    すべて同一の `(term, index, entry_hash)` に対する有効な署名であることを検証する
     pub fn verify_quorum_certificate(
         &mut self,
         qc: &QuorumCertificate,
     ) -> Result<(), &'static str> {
+        if qc.index == 0 || qc.term == 0 || qc.term > MAX_SAFE_TERM {
+            self.rejected_byzantine_packets += 1;
+            return Err("Byzantine QC Invalid: index or term out of valid bounds");
+        }
+
         // 1. 自身のログに該当 index が存在し、ハッシュが一致するか確認（二枚舌 Equivocation の検知）
-        if let Some(local_entry) = self.log.get((qc.index.saturating_sub(1)) as usize) {
-            if local_entry.term == qc.term && local_entry.digest() != qc.entry_hash {
+        match self.log.get((qc.index - 1) as usize) {
+            Some(local_entry) => {
+                if local_entry.term != qc.term || local_entry.digest() != qc.entry_hash {
+                    self.rejected_byzantine_packets += 1;
+                    return Err("Byzantine Equivocation Detected: Leader sent conflicting log entries or mismatched QC hash!");
+                }
+            }
+            None => {
                 self.rejected_byzantine_packets += 1;
-                return Err("Byzantine Equivocation Detected: Leader sent conflicting log entries for the same (term, index)!");
+                return Err(
+                    "Byzantine QC Invalid: QC refers to a log index not present on follower",
+                );
             }
         }
 
-        // 2. 重複のない有効な署名数が Quorum 以上あるか検証
+        // 2. 重複のない有効な署名数が BFT Quorum 以上あるか検証
         let payload = qc_vote_payload(qc.term, qc.index, &qc.entry_hash);
         let mut valid_signers = BTreeSet::new();
 
@@ -460,8 +582,8 @@ impl ConsensusState {
         Ok(())
     }
 
-    /// 受信したコンセンサス RPC を処理し、必要に応じて応答 RPC を返す
-    pub fn handle_rpc(&mut self, rpc: ConsensusRpc) -> Option<ConsensusRpc> {
+    /// 署名検証を通過したコンセンサス RPC の内部処理（直接の外部呼び出し不可）
+    fn process_verified_rpc(&mut self, rpc: ConsensusRpc) -> Option<ConsensusRpc> {
         match rpc {
             ConsensusRpc::RequestVote {
                 term,
@@ -502,9 +624,17 @@ impl ConsensusState {
                 follower_id,
                 success,
                 match_index,
-                entry_hash: _,
+                entry_hash,
+                qc_vote_signature,
             } => {
-                self.on_append_entries_response(term, follower_id, success, match_index);
+                self.on_append_entries_response(
+                    term,
+                    follower_id,
+                    success,
+                    match_index,
+                    entry_hash,
+                    qc_vote_signature,
+                );
                 None
             }
         }
@@ -552,11 +682,34 @@ impl ConsensusState {
         if self.role != Role::Candidate || term != self.current_term {
             return;
         }
-        if vote_granted {
+        if vote_granted && (voter_id == self.node_id || self.peers.contains(&voter_id)) {
             self.votes_received.insert(voter_id);
             if self.votes_received.len() >= self.quorum_size() {
                 self.become_leader();
             }
+        }
+    }
+
+    fn make_append_response(&self, success: bool) -> ConsensusRpc {
+        let match_index = self.last_log_index();
+        let (entry_term, entry_hash) = self
+            .log
+            .last()
+            .map(|e| (e.term, e.digest()))
+            .unwrap_or((self.current_term, [0u8; 32]));
+        let qc_vote_signature = if success && match_index > 0 {
+            self.identity
+                .sign_qc_vote(entry_term, match_index, &entry_hash)
+        } else {
+            Vec::new()
+        };
+        ConsensusRpc::AppendEntriesResponse {
+            term: self.current_term,
+            follower_id: self.node_id.clone(),
+            success,
+            match_index,
+            entry_hash,
+            qc_vote_signature,
         }
     }
 
@@ -571,15 +724,31 @@ impl ConsensusState {
         leader_commit: u64,
         commit_qc: Option<QuorumCertificate>,
     ) -> ConsensusRpc {
-        let last_hash = self.log.last().map(|e| e.digest()).unwrap_or([0u8; 32]);
         if term < self.current_term {
-            return ConsensusRpc::AppendEntriesResponse {
-                term: self.current_term,
-                follower_id: self.node_id.clone(),
-                success: false,
-                match_index: self.last_log_index(),
-                entry_hash: last_hash,
+            return self.make_append_response(false);
+        }
+
+        // エントリ配列のサイズ・連番 Index (index >= 1)・Term 整合性を事前検証（index=0 アンダーフロー Panic 防止）
+        if entries.len() > MAX_LOG_ENTRIES_PER_RPC {
+            self.rejected_byzantine_packets += 1;
+            return self.make_append_response(false);
+        }
+        for (offset, entry) in entries.iter().enumerate() {
+            let expected_idx = match prev_log_index.checked_add((offset as u64) + 1) {
+                Some(idx) if idx >= 1 => idx,
+                _ => {
+                    self.rejected_byzantine_packets += 1;
+                    return self.make_append_response(false);
+                }
             };
+            if entry.index != expected_idx
+                || entry.term == 0
+                || entry.term > term
+                || entry.term > MAX_SAFE_TERM
+            {
+                self.rejected_byzantine_packets += 1;
+                return self.make_append_response(false);
+            }
         }
 
         if term > self.current_term || self.role == Role::Candidate {
@@ -588,13 +757,7 @@ impl ConsensusState {
         self.leader_id = Some(leader_id);
 
         if prev_log_index > self.last_log_index() || self.term_at(prev_log_index) != prev_log_term {
-            return ConsensusRpc::AppendEntriesResponse {
-                term: self.current_term,
-                follower_id: self.node_id.clone(),
-                success: false,
-                match_index: self.last_log_index(),
-                entry_hash: last_hash,
-            };
+            return self.make_append_response(false);
         }
 
         for entry in entries {
@@ -604,13 +767,12 @@ impl ConsensusState {
                 let existing = &self.log[(idx - 1) as usize];
                 if existing.term == entry.term && existing.digest() != entry.digest() {
                     self.rejected_byzantine_packets += 1;
-                    return ConsensusRpc::AppendEntriesResponse {
-                        term: self.current_term,
-                        follower_id: self.node_id.clone(),
-                        success: false,
-                        match_index: self.last_log_index(),
-                        entry_hash: existing.digest(),
-                    };
+                    return self.make_append_response(false);
+                }
+                // コミット済み領域（idx <= commit_index）の書き換え試行もビザンチン違反として拒否
+                if idx <= self.commit_index && existing.digest() != entry.digest() {
+                    self.rejected_byzantine_packets += 1;
+                    return self.make_append_response(false);
                 }
                 if self.term_at(idx) != entry.term {
                     self.log.truncate((idx - 1) as usize);
@@ -621,33 +783,31 @@ impl ConsensusState {
             }
         }
 
-        // マルチシグ QC が添付されている場合は暗号検証を実行し、不正なら Commit を拒否する！
-        if let Some(ref qc) = commit_qc {
+        // リーダーが commit_index を進めるよう要求している場合、有効なマルチシグ QuorumCertificate を必須とする！
+        let target_commit = leader_commit.min(self.last_log_index());
+        if target_commit > self.commit_index {
+            match commit_qc {
+                Some(ref qc) if qc.index == target_commit => {
+                    if self.verify_quorum_certificate(qc).is_err() {
+                        return self.make_append_response(false);
+                    }
+                    self.commit_qcs.insert(qc.index, qc.clone());
+                    self.commit_index = target_commit;
+                    self.apply_committed_entries();
+                }
+                _ => {
+                    // commit_qc が None、または対象 index と不一致の単独コミット要求は拒否！
+                    self.rejected_byzantine_packets += 1;
+                    return self.make_append_response(false);
+                }
+            }
+        } else if let Some(ref qc) = commit_qc {
             if self.verify_quorum_certificate(qc).is_err() {
-                let cur_hash = self.log.last().map(|e| e.digest()).unwrap_or([0u8; 32]);
-                return ConsensusRpc::AppendEntriesResponse {
-                    term: self.current_term,
-                    follower_id: self.node_id.clone(),
-                    success: false,
-                    match_index: self.last_log_index(),
-                    entry_hash: cur_hash,
-                };
+                return self.make_append_response(false);
             }
         }
 
-        if leader_commit > self.commit_index {
-            self.commit_index = leader_commit.min(self.last_log_index());
-            self.apply_committed_entries();
-        }
-
-        let current_hash = self.log.last().map(|e| e.digest()).unwrap_or([0u8; 32]);
-        ConsensusRpc::AppendEntriesResponse {
-            term: self.current_term,
-            follower_id: self.node_id.clone(),
-            success: true,
-            match_index: self.last_log_index(),
-            entry_hash: current_hash,
-        }
+        self.make_append_response(true)
     }
 
     fn on_append_entries_response(
@@ -656,6 +816,8 @@ impl ConsensusState {
         follower_id: NodeId,
         success: bool,
         match_index: u64,
+        entry_hash: [u8; 32],
+        qc_vote_signature: Vec<u8>,
     ) {
         if term > self.current_term {
             self.step_down(term);
@@ -664,8 +826,41 @@ impl ConsensusState {
         if self.role != Role::Leader || term != self.current_term {
             return;
         }
+        if !self.peers.contains(&follower_id) {
+            self.rejected_byzantine_packets += 1;
+            return;
+        }
 
         if success {
+            if match_index > self.last_log_index() {
+                self.rejected_byzantine_packets += 1;
+                return;
+            }
+            if match_index > 0 {
+                let leader_entry = &self.log[(match_index - 1) as usize];
+                if leader_entry.digest() != entry_hash {
+                    self.rejected_byzantine_packets += 1;
+                    return;
+                }
+                let pk_bytes = match self.peer_public_keys.get(&follower_id) {
+                    Some(pk) => pk,
+                    None => {
+                        self.rejected_byzantine_packets += 1;
+                        return;
+                    }
+                };
+                let payload = qc_vote_payload(leader_entry.term, match_index, &entry_hash);
+                let pub_key = UnparsedPublicKey::new(&signature::ED25519, pk_bytes);
+                if pub_key.verify(&payload, &qc_vote_signature).is_err() {
+                    self.rejected_byzantine_packets += 1;
+                    return;
+                }
+                self.qc_votes
+                    .entry(match_index)
+                    .or_default()
+                    .insert(follower_id.clone(), qc_vote_signature);
+            }
+
             self.match_index.insert(follower_id.clone(), match_index);
             self.next_index.insert(follower_id, match_index + 1);
             self.advance_commit_index();
@@ -685,10 +880,26 @@ impl ConsensusState {
             if self.term_at(n) != self.current_term {
                 continue;
             }
-            let replicated_count = 1 + self.match_index.values().filter(|&&m| m >= n).count();
+            let entry = &self.log[(n - 1) as usize];
+            let entry_hash = entry.digest();
+            let entry_term = entry.term;
 
-            if replicated_count >= self.quorum_size() {
-                self.commit_index = n;
+            let sig_map = match self.qc_votes.get(&n) {
+                Some(m) => m.clone(),
+                None => continue,
+            };
+
+            if sig_map.len() >= self.quorum_size() {
+                let qc = QuorumCertificate {
+                    term: entry_term,
+                    index: n,
+                    entry_hash,
+                    signatures: sig_map,
+                };
+                if self.verify_quorum_certificate(&qc).is_ok() {
+                    self.commit_qcs.insert(n, qc);
+                    self.commit_index = n;
+                }
             }
         }
         self.apply_committed_entries();
