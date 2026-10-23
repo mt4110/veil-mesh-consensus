@@ -2,24 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-23
 
-### Added
+### Changed
 
-- **クラウド・エッジ環境別 実践導入ガイド (`docs/CLOUD_DEPLOYMENT_GUIDE.md`)**: AWS (EC2/ENA)、GCP (GCE/gVNIC)、Microsoft Azure (Azure VM/NSG)、Cloudflare、Vercel それぞれの対応可否マトリクスとステップバイステップの導入手順書を追加。
-- **品質保証・自動リント基盤**: `.pre-commit-config.yaml`、`.markdownlint-cli2.jsonc`、`scripts/lint-markdown.sh`（`.gitignore` 対象外の全 `.md` ファイルを自動検査）、`scripts/check.sh`、および GitHub Actions CI (`.github/workflows/ci.yml`) を追加。
-- **OSS ガバナンス文書**: `SECURITY.md`、`CONTRIBUTING.md`、`CHANGELOG.md`、および Issue / PR テンプレート一式を追加。
+- **クリーンアーキテクチャへの構造刷新 (`veil-node/src/{domain,usecase,adapter,infra}`)**:
+  - `domain`: エンティティ定義と保護対象 IP 誤遮断防止ガードレール (`SecurityPolicyGuard`)・境界値検証ロジックを分離。
+  - `usecase`: `ConsensusState` ステートマシンと `EbpfBridge` 出力ポートを分離。
+  - `adapter`: `ring` による Ed25519 CSPRNG 乱数鍵生成・`0600` 鍵ファイル永続化 (`NodeCryptoIdentity`) とワイヤーフレーム (`WireMessage`) を分離。
+  - `infra`: `quinn` mTLS 1.3 通信 (`ClusterMtlsPki`)、Aya カーネルブリッジ、Ratatui TUI アリーナを分離。
+- **CSPRNG 乱数鍵生成と `--key-file` / 複数 `--peer` 対応**:
+  - ノード名から決定論的に秘密鍵を導出していた `derive_default_node_seed` を廃止し、`ring::rand::SystemRandom` による乱数生成と `--key-file` 永続化に統一。
+  - `term >= MAX_SAFE_TERM` の境界オフバイワン修正と回帰テスト (`proof_11`) を追加。
+  - 全ドキュメント（`README.md`, `SECURITY.md`, `docs/CONSENSUS_AND_EBPF_PROOF.md`, `docs/CLOUD_DEPLOYMENT_GUIDE.md`）から誇張表現を排除し、検証済み範囲と既知の限界を明記。
+
+## [0.1.1] - 2026-10-23
+
+### Fixed
+
+- **QUIC ネットワーク経路での `SignedConsensusRpc` 強制と mTLS 化**:
+  - `WireMessage::Consensus` を `SignedConsensusRpc` のみに変更し、受信時に `handle_signed_rpc` を強制（回帰テスト `proof_9`）。
+  - `SkipServerVerification` を廃止し、`ClusterMtlsPki` による相互 TLS 認証を導入。
+- **コミット進行時のマルチシグ `QuorumCertificate` 必須化と 4ノード定足数 ($\lfloor 2N/3 \rfloor + 1$)**:
+  - `commit_qc: None` でのコミット要求を拒否し、`AppendEntriesResponse` の `entry_hash` と `qc_vote_signature` をリーダーが検証するよう修正（回帰テスト `proof_8`, `proof_10`）。
+- **境界値検証と導入ガイド追加**:
+  - `index == 0` のアンダーフロー Panic 防止（`proof_11`）。
+  - `docs/CLOUD_DEPLOYMENT_GUIDE.md`、`.pre-commit-config.yaml`、`markdownlint-cli2` 検査スクリプトを追加。
 
 ## [0.1.0] - 2026-10-23
 
 ### Added
 
-- **低レイヤー QUIC + BFT Raft コンセンサスエンジン (`veil-node/src/consensus.rs`)**:
-  - `Tokio` + `quinn` (TLS 1.3 over UDP 5000) 双方向ストリーム上の合意形成。
-  - Ed25519 署名検証 (`SignedConsensusRpc`) による外部なりすまし・改ざんの 100% 阻止。
-  - SHA-256 ログダイジェストと $2f+1$ マルチシグ合意証明書 (`QuorumCertificate`) によるリーダー裏切り・二枚舌（Equivocation）の完全阻止。
-- **Linux カーネル eBPF 即時遮断 & LSM ステルス GC (`veil-ebpf`, `veil-node/src/ebpf_bridge.rs`)**:
-  - `PEER_POLICY_MAP` による NIC 着信直後の `XDP_DROP` パケット破棄。
-  - `LSM_POLICY_MAP` による `socket_connect` の `-EPERM` 封鎖と機密鍵メモリの即時ゼロ消去 (`Zeroize`)。
-- **インタラクティブ TUI アリーナ (`veil-node/src/tui.rs`) & 8大証明テスト (`proof_1` 〜 `proof_8`)**:
-  - 実 OS モック攻撃プロセスの生成からコンセンサス合意、`sys_bpf` (`XDP_DROP`)、`sys_kill(PID, SIGKILL=9)` による撃退までを可視化する TUI ダッシュボードと実機 `pi-node` 検証スクリプト。
+- 初回実験プロトタイプ公開（QUIC + Raft ベース合意状態機械、Linux XDP `veil_xdp_kern.c`、Ratatui TUI アリーナ、Nix Flakes MicroVM 構成）。

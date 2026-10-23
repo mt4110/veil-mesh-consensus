@@ -2,19 +2,19 @@
 
 [README（日本語）](../README.md) · [English README](../README_EN.md) · [証明解説書](CONSENSUS_AND_EBPF_PROOF.md)
 
-本書では、`veil-mesh-consensus`（QUIC BFT コンセンサス ＋ Linux カーネル eBPF `XDP` / `LSM`）をパブリッククラウドやエッジプラットフォームへ実践導入する際の **対応可否マトリクス** と、**各プラットフォーム別のステップバイステップ構築手順** を解説します。
+本書では、`veil-mesh-consensus`（mTLS QUIC 署名付き合意形成 ＋ Linux カーネル eBPF `XDP` / LSM ブリッジ）をパブリッククラウドやエッジプラットフォームへ導入する際の **対応可否マトリクス** と、**各プラットフォーム別のステップバイステップ構築手順** を解説します。
 
 ---
 
 ## 1. プラットフォーム別の導入可否マトリクス（結論）
 
-`veil-mesh-consensus` は **Linux カーネル空間の eBPF (`BPF_PROG_TYPE_XDP` / `BPF_PROG_TYPE_LSM`)** と **UDP 5000 番ポート上の QUIC 双方向通信** を使用します。そのため、「顧客自身が Linux カーネル（VM / ベアメタル / 専用ノード）の特権 (`CAP_BPF`, `CAP_NET_ADMIN`) を持てるか」によって導入方式が明確に分かれます。
+`veil-mesh-consensus` は **Linux カーネル空間の eBPF (`BPF_PROG_TYPE_XDP`)** と **UDP 5000 番ポート上の mTLS QUIC 双方向通信** を使用します（LSM 制御は現時点ではユーザー空間ブリッジでシミュレートしており、実カーネルの BPF LSM は `veil-warden` と連携します）。そのため、「利用者自身が Linux カーネル（VM / ベアメタル / 専用ノード）の特権 (`CAP_BPF`, `CAP_NET_ADMIN`) を持てるか」によって導入方式が分かれます。
 
 | プラットフォーム | 直接導入（eBPF + QUIC） | 推奨アーキテクチャ・役割 | 理由・技術的根拠 |
 | :--- | :---: | :--- | :--- |
-| **AWS** (EC2 / EKS) | **◎ 完全対応** | **コア防衛メッシュ層** (Nitro ENA Native XDP + LSM) | 専用 Linux カーネル（Amazon Linux 2023 / Ubuntu 24.04+ / NixOS）上で ENA ドライバの Native XDP と `lsm=bpf` がフル稼働するため。 |
-| **GCP** (Compute Engine / GKE) | **◎ 完全対応** | **コア防衛メッシュ層** (gVNIC XDP + LSM) | `gVNIC` (Google Virtual NIC) が XDP をサポートしており、Ubuntu / Container-Optimized OS 等で高速なパケット遮断が可能なため。 |
-| **Microsoft Azure** (Azure VM / AKS) | **◎ 完全対応** | **コア防衛メッシュ層** (MANA / Accelerated Networking XDP + LSM) | Azure Linux / Ubuntu 24.04+ において、高速ネットワーク（MANA / Mellanox）上の XDP とカーネル LSM がそのまま動作するため。 |
+| **AWS** (EC2 / EKS) | **◎ 対応** | **コア防衛メッシュ層** (Nitro ENA XDP) | 専用 Linux カーネル（Amazon Linux 2023 / Ubuntu 24.04+ / NixOS）上で ENA ドライバの XDP が動作するため。 |
+| **GCP** (Compute Engine / GKE) | **◎ 対応** | **コア防衛メッシュ層** (gVNIC XDP) | `gVNIC` (Google Virtual NIC) が XDP をサポートしており、Ubuntu 等でパケット遮断が可能なため。 |
+| **Microsoft Azure** (Azure VM / AKS) | **◎ 対応** | **コア防衛メッシュ層** (MANA / Accelerated Networking XDP) | Azure Linux / Ubuntu 24.04+ において、高速ネットワーク上の XDP が動作するため。 |
 | **Cloudflare** (WAF / Workers / Magic Transit) | **△ 連携対応（センサー＆エッジ遮断層）** | **前段 L7/L3 エッジセンサー ＋ Webhook 連携** | Cloudflare のサーバー上に顧客の Linux eBPF はロードできないが、**Cloudflare を前段センサー、バックエンド VM クラスタを `veil-mesh-consensus` で守る構成（または合意結果を Cloudflare Firewall API へ自動反映する構成）** が極めて有効なため。 |
 | **Vercel** (Functions / Edge Network) | **✕ 単体導入は不可（バックエンド保護で連携）** | **フロントエンド層（裏側の API クラスタを保護）** | Vercel はマネージドなサーバーレス実行環境（V8 Isolates / Firecracker 抽象化層）であり、利用者に `CAP_BPF` や NIC への XDP アタッチ権限が開放されていないため。Vercel から呼ばれるバックエンド API サーバー群（AWS/GCP/Azure 等）側に本ツールを導入します。 |
 

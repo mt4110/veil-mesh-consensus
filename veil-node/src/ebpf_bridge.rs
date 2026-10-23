@@ -1,25 +1,9 @@
+pub use crate::usecase::ports::EbpfBridge;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use tracing::info;
 use veil_common::{NodeLsmPolicy, PeerPolicy};
-
-/// コンセンサス層（`ConsensusState`）からカーネル空間の eBPF マップへ状態をリアルタイム同期するブリッジトレイト
-pub trait EbpfBridge: Send + Sync {
-    /// `PEER_POLICY_MAP` の特定 IP の信頼ポリシー（`XDP_PASS` / `XDP_DROP`）を更新する
-    fn sync_peer_policy(&self, peer_ip: u32, policy: PeerPolicy) -> Result<()>;
-
-    /// `LSM_POLICY_MAP[0]` のノード隔離・ステルス GC ポリシー（`0` / `-EPERM`）を更新する
-    fn sync_lsm_policy(&self, policy: NodeLsmPolicy) -> Result<()>;
-
-    /// ステルス GC 発動時に機密メモリやエフェメラル状態のゼロ消去（パージ）を実行した回数を返す
-    fn stealth_gc_purge_count(&self) -> u64;
-
-    /// カーネルまたはシミュレータの `PACKETS_SEEN_MAP` から `(XDP_PASS, XDP_DROP)` の実パケット数を取得する
-    fn read_xdp_counters(&self) -> Option<(u64, u64)> {
-        None
-    }
-}
 
 /// テストおよび非 Linux ホスト環境（macOS 等）でもカーネル eBPF マップへの書き込みと
 /// ステルス GC パージ動作を完全再現・検証できるインメモリ・カーネルブリッジ
