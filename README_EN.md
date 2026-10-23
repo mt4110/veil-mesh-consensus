@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/mt4110/veil-mesh-consensus)](https://github.com/mt4110/veil-mesh-consensus/releases)
 
-[日本語 (Main)](README.md) · [☁️ Cloud Deployment Guide (AWS/GCP/Azure/CF/Vercel)](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 Proof Documentation](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
+[日本語 (Main)](README.md) · [🧭 v1.0 Architecture & Roadmap](docs/V1_ARCHITECTURE_AND_ROADMAP.md) · [☁️ Cloud Deployment Guide (AWS/GCP/Azure/CF/Vercel)](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 Proof Documentation](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
 
 **An experimental prototype that synchronizes block rules decided by signed Raft-based consensus (Ed25519 `SignedConsensusRpc` + Multi-Signature `QuorumCertificate` over mTLS QUIC) into Linux kernel eBPF (`Aya` XDP packet filtering) and a user-space LSM simulation bridge.**
 
