@@ -1390,3 +1390,244 @@ fn regression_wal_crash_recovery_prevents_double_vote_and_restores_ebpf_state() 
     let _ = std::fs::remove_dir_all(&wal_dir);
     Ok(())
 }
+
+#[test]
+fn proof_12_v0_4_view_change_timeout_certificate_rotates_leader_on_censorship() {
+    let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
+
+    // Term 1: alpha がリーダーに選出される
+    let rv = alpha.start_signed_election();
+    for peer in [&mut beta, &mut gamma, &mut delta] {
+        let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
+        alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+    }
+    assert_eq!(alpha.role, Role::Leader);
+    assert_eq!(alpha.current_term, 1);
+
+    // まず 1件 (Index 1) を正常コミットして highest_qc を形成させる
+    let first_ip = Ipv4Addr::new(198, 51, 100, 1);
+    alpha
+        .propose(MeshCommand::set_trust(first_ip, false))
+        .unwrap();
+    for _round in 0..2 {
+        for (peer_name, peer) in [
+            ("node-beta", &mut beta),
+            ("node-gamma", &mut gamma),
+            ("node-delta", &mut delta),
+        ] {
+            let ae = alpha.sign_rpc(alpha.make_append_entries(peer_name).unwrap());
+            let resp = peer.handle_signed_rpc(ae).unwrap().unwrap();
+            alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+        }
+    }
+    assert_eq!(beta.commit_index, 1);
+    assert_eq!(gamma.commit_index, 1);
+    assert_eq!(delta.commit_index, 1);
+
+    // ここからリーダー alpha が沈黙・検閲攻撃を開始したと仮定。
+    // 誠実な 3台 (beta, gamma, delta) が Term 1 に対する TimeoutVote を生成し相互ブロードキャストする。
+    let tv_beta = beta.trigger_view_timeout();
+    let tv_gamma = gamma.trigger_view_timeout();
+    let tv_delta = delta.trigger_view_timeout();
+
+    for tv in [tv_beta, tv_gamma, tv_delta] {
+        beta.handle_signed_rpc(tv.clone()).unwrap();
+        gamma.handle_signed_rpc(tv.clone()).unwrap();
+        delta.handle_signed_rpc(tv).unwrap();
+    }
+
+    // 3/4 の TimeoutVote が集まったことで TimeoutCertificate (TC) が成立し、
+    // Term 2 の決定論的ラウンドロビン・リーダー ("node-beta") へ自動的に交代していることを検証
+    assert_eq!(beta.current_term, 2);
+    assert_eq!(gamma.current_term, 2);
+    assert_eq!(delta.current_term, 2);
+    assert_eq!(beta.role, Role::Leader);
+    assert_eq!(gamma.leader_id, Some("node-beta".into()));
+    assert_eq!(delta.leader_id, Some("node-beta".into()));
+    assert!(beta.timeout_certificates.contains_key(&1));
+
+    // 新リーダー beta が新しい遮断ルール (Index 2) を提案・コミットできることを確認
+    let second_ip = Ipv4Addr::new(198, 51, 100, 2);
+    beta.propose(MeshCommand::set_trust(second_ip, false))
+        .unwrap();
+    for _round in 0..2 {
+        for (peer_name, peer) in [("node-gamma", &mut gamma), ("node-delta", &mut delta)] {
+            let ae = beta.sign_rpc(beta.make_append_entries(peer_name).unwrap());
+            let resp = peer.handle_signed_rpc(ae).unwrap().unwrap();
+            beta.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+        }
+    }
+    assert_eq!(beta.commit_index, 2);
+    assert_eq!(gamma.commit_index, 2);
+    assert_eq!(delta.commit_index, 2);
+    assert_eq!(gamma.check_xdp_packet(second_ip), XdpVerdict::Drop);
+}
+
+#[test]
+fn proof_13_v0_5_ttl_auto_expiry_micro_batch_emergency_bypass_and_prometheus_metrics() {
+    let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
+
+    let rv = alpha.start_signed_election();
+    for peer in [&mut beta, &mut gamma, &mut delta] {
+        let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
+        alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+    }
+
+    // 1. マイクロバッチ（50 IP 一括、TTL = 60秒）を提案・合意
+    let batch_rules: Vec<crate::domain::PeerTrustRule> = (1..=50u8)
+        .map(|i| crate::domain::PeerTrustRule::new(Ipv4Addr::new(203, 0, 113, i), false, 60))
+        .collect();
+    alpha
+        .propose(MeshCommand::set_trust_batch(batch_rules))
+        .unwrap();
+
+    // 保護対象 IP (127.0.0.1) がバッチに1つでも混入していれば即座に拒否されることを確認
+    let bad_batch = vec![
+        crate::domain::PeerTrustRule::new(Ipv4Addr::new(203, 0, 113, 200), false, 60),
+        crate::domain::PeerTrustRule::new(Ipv4Addr::LOCALHOST, false, 60),
+    ];
+    assert!(alpha
+        .propose(MeshCommand::set_trust_batch(bad_batch))
+        .is_err());
+
+    for _round in 0..2 {
+        for (peer_name, peer) in [
+            ("node-beta", &mut beta),
+            ("node-gamma", &mut gamma),
+            ("node-delta", &mut delta),
+        ] {
+            let ae = alpha.sign_rpc(alpha.make_append_entries(peer_name).unwrap());
+            let resp = peer.handle_signed_rpc(ae).unwrap().unwrap();
+            alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+        }
+    }
+
+    let sample_ip = Ipv4Addr::new(203, 0, 113, 25);
+    assert_eq!(beta.check_xdp_packet(sample_ip), XdpVerdict::Drop);
+    assert_eq!(beta.ebpf_policy_map.len(), 50);
+
+    // 2. 緊急ローカルバイパス (bypass-local on) の動作確認
+    beta.set_emergency_local_bypass(true);
+    assert_eq!(beta.check_xdp_packet(sample_ip), XdpVerdict::Pass);
+    let metrics_bypass = beta.render_prometheus_metrics();
+    assert!(metrics_bypass.contains("veil_emergency_local_bypass{node=\"node-beta\"} 1"));
+    assert!(metrics_bypass.contains("veil_ebpf_blocked_ips{node=\"node-beta\"} 50"));
+
+    beta.set_emergency_local_bypass(false);
+    assert_eq!(beta.check_xdp_packet(sample_ip), XdpVerdict::Drop);
+
+    // 3. 単調増加クロックを 30秒進める（TTL 60秒未満なのでまだ Drop 維持）
+    assert_eq!(beta.advance_monotonic_clock(30), 0);
+    assert_eq!(beta.check_xdp_packet(sample_ip), XdpVerdict::Drop);
+
+    // さらに 31秒（計 61秒 >= TTL 60秒）進めると、50件すべて自動失効して Pass に復帰し BPF マップからも除去される
+    let expired = beta.advance_monotonic_clock(31);
+    assert_eq!(expired, 50);
+    assert_eq!(beta.check_xdp_packet(sample_ip), XdpVerdict::Pass);
+    assert!(beta.ebpf_policy_map.is_empty());
+}
+
+#[test]
+fn proof_14_v0_9_1_adversarial_chaos_partition_byzantine_flood_and_wal_recovery() -> Result<()> {
+    let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
+    let wal_dir = std::env::temp_dir().join(format!("veil-chaos-v091-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    std::fs::create_dir_all(&wal_dir)?;
+    let gamma_wal = wal_dir.join("gamma.wal");
+
+    // Step 1: Term 1 で alpha がリーダーになり、攻撃 IP #1 (TTL 120s) をコミット
+    let rv = alpha.start_signed_election();
+    for peer in [&mut beta, &mut gamma, &mut delta] {
+        let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
+        alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+    }
+    let ip1 = Ipv4Addr::new(192, 0, 2, 10);
+    alpha
+        .propose(MeshCommand::set_trust_with_ttl(ip1, false, 120))
+        .unwrap();
+    for _round in 0..2 {
+        for (peer_name, peer) in [
+            ("node-beta", &mut beta),
+            ("node-gamma", &mut gamma),
+            ("node-delta", &mut delta),
+        ] {
+            let ae = alpha.sign_rpc(alpha.make_append_entries(peer_name).unwrap());
+            let resp = peer.handle_signed_rpc(ae).unwrap().unwrap();
+            alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+        }
+    }
+    gamma.save_wal(&gamma_wal)?;
+
+    // Step 2: ビザンチンノード delta が偽造署名・境界外 Term・不正 QC を誠実ノード群に大量送信（Byzantine Flood）
+    let mut forged = delta.sign_rpc(ConsensusRpc::AppendEntries {
+        term: 99,
+        leader_id: "node-delta".into(),
+        prev_log_index: 1,
+        prev_log_term: 1,
+        entries: vec![],
+        leader_commit: 1,
+        commit_qc: None,
+    });
+    forged.signature[0] ^= 0x55;
+    for _ in 0..10 {
+        assert!(beta.handle_signed_rpc(forged.clone()).is_err());
+        assert!(gamma.handle_signed_rpc(forged.clone()).is_err());
+    }
+    assert!(beta.rejected_byzantine_packets >= 10);
+
+    // Step 3: リーダー alpha が孤立（またはクラッシュ）し、さらに gamma が再起動して WAL から復旧
+    let mut gamma_rebooted = ConsensusState::new(
+        "node-gamma",
+        vec!["node-alpha".into(), "node-beta".into(), "node-delta".into()],
+    );
+    gamma_rebooted.identity = gamma.identity.clone();
+    gamma_rebooted.register_peer_public_keys(gamma.peer_public_keys.clone());
+    gamma_rebooted.load_wal(&gamma_wal)?;
+    assert_eq!(gamma_rebooted.commit_index, 1);
+    assert_eq!(gamma_rebooted.check_xdp_packet(ip1), XdpVerdict::Drop);
+
+    // Step 4: TimeoutCertificate による View-Change で Term 2 の新リーダー beta へ移行し、ip2 を追加合意
+    let tv_b = beta.trigger_view_timeout();
+    let tv_g = gamma_rebooted.trigger_view_timeout();
+    let tv_d = delta.trigger_view_timeout();
+    for tv in [tv_b, tv_g, tv_d] {
+        beta.handle_signed_rpc(tv.clone()).unwrap();
+        gamma_rebooted.handle_signed_rpc(tv.clone()).unwrap();
+        delta.handle_signed_rpc(tv).unwrap();
+    }
+    assert_eq!(beta.role, Role::Leader);
+    assert_eq!(beta.current_term, 2);
+
+    let ip2 = Ipv4Addr::new(192, 0, 2, 20);
+    beta.propose(MeshCommand::set_trust_with_ttl(ip2, false, 300))
+        .unwrap();
+    for _round in 0..2 {
+        for (peer_name, peer) in [
+            ("node-gamma", &mut gamma_rebooted),
+            ("node-delta", &mut delta),
+        ] {
+            let ae = beta.sign_rpc(beta.make_append_entries(peer_name).unwrap());
+            let resp = peer.handle_signed_rpc(ae).unwrap().unwrap();
+            beta.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+        }
+    }
+
+    // Step 5: 分断されていた旧リーダー alpha が復帰し、新リーダー beta から AppendEntries を受けて完全収束
+    for _round in 0..3 {
+        let ae = beta.sign_rpc(beta.make_append_entries("node-alpha").unwrap());
+        let resp = alpha.handle_signed_rpc(ae).unwrap().unwrap();
+        beta.handle_signed_rpc(alpha.sign_rpc(resp)).unwrap();
+    }
+
+    // 全誠実ノード (alpha, beta, gamma_rebooted) の状態が Index 2 で完全一致していることを証明
+    for node in [&alpha, &beta, &gamma_rebooted] {
+        assert_eq!(node.commit_index, 2);
+        assert_eq!(node.last_applied, 2);
+        assert_eq!(node.entry_hash_at(2), beta.entry_hash_at(2));
+        assert_eq!(node.check_xdp_packet(ip1), XdpVerdict::Drop);
+        assert_eq!(node.check_xdp_packet(ip2), XdpVerdict::Drop);
+    }
+
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    Ok(())
+}

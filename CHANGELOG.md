@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] - 2026-10-23
+
+### Added
+
+- **Adversarial Chaos & Recovery Verification Suite (`proof_14`)**:
+  - 4ノードクラスタにおける「ビザンチン偽造署名 Flood」「リーダー孤立・検閲」「ノード再起動 + Crash-Recovery WAL 復元」「`TimeoutCertificate` (TC) による View-Change」「旧リーダー復帰後の完全状態収束」を一気通貫で検証する統合カオステスト (`proof_14_v0_9_1_adversarial_chaos_partition_byzantine_flood_and_wal_recovery`) を追加。全23テスト（`proof_1`〜`proof_14` + R1〜R10 回帰テスト群）が 100% パスすることを実証。
+
+## [0.5.0] - 2026-10-23
+
+### Added
+
+- **TTL 自動失効 (Relative TTL Auto-Expiry) とマイクロバッチ合意 (`SetPeerTrustBatch`)**:
+  - `PeerTrustRule { peer_ip, trusted, ttl_secs }` および `MeshCommand::SetPeerTrustBatch`（最大 128 ルール一括合意）を追加。
+  - 単調増加クロック (`monotonic_now_ns`) に基づく自動失効 (`advance_monotonic_clock` / `expire_stale_policies`) により、NTP 時刻ズレに影響されず期限切れルールを自動解除しカーネル eBPF マップからも回収（`proof_13`）。
+- **緊急ローカルバイパス (`set_emergency_local_bypass`) & Prometheus メトリクス出力 (`render_prometheus_metrics`)**:
+  - 誤検知時の緊急退避用にコンセンサス履歴を保持したままローカル XDP 判定を `Pass` に切り替えるバイパススイッチと、Prometheus 互換メトリクス出力機能を追加（`proof_13`）。
+
+## [0.4.0] - 2026-10-23
+
+### Added
+
+- **BFT View-Change (`TimeoutVote` / `TimeoutCertificate`) と決定論的ラウンドロビン・リーダー交代**:
+  - 悪意あるリーダーの沈黙・検閲攻撃（Liveness 妨害）に対処するため、$\lfloor 2N/3 \rfloor + 1$ 台の署名付き `TimeoutVote` から `TimeoutCertificate` (TC) を形成し、次の Term の決定論的ラウンドロビン・リーダー (`deterministic_leader_for_term`) へ強制交代する View-Change 機構を実装（`proof_12`）。
+
 ## [0.3.0] - 2026-10-23
 
 ### Security & Fixed

@@ -1,8 +1,8 @@
 use crate::adapter::NodeCryptoIdentity;
 use crate::domain::{
-    qc_vote_payload, ConsensusRpc, LogEntry, MeshCommand, NodeId, QuorumCertificate, Role,
-    SecurityPolicyGuard, SignedConsensusRpc, MAX_LOG_ENTRIES_PER_RPC, MAX_SAFE_TERM,
-    MAX_WIRE_MESSAGE_BYTES,
+    qc_vote_payload, timeout_vote_payload, ConsensusRpc, LogEntry, MeshCommand, NodeId,
+    PeerTrustRule, QuorumCertificate, Role, SecurityPolicyGuard, SignedConsensusRpc,
+    TimeoutCertificate, MAX_LOG_ENTRIES_PER_RPC, MAX_SAFE_TERM, MAX_WIRE_MESSAGE_BYTES,
 };
 use crate::usecase::ports::EbpfBridge;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,9 @@ use veil_common::{
 };
 
 const WAL_MAGIC_VERSION: u32 = 1;
+
+/// `voter_id -> (high_qc_term, high_qc_index, Ed25519 Signature)`
+pub type TermTimeoutVoteMap = BTreeMap<NodeId, (u64, u64, Vec<u8>)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WalPayload {
@@ -33,7 +36,7 @@ struct WalEnvelope {
     sha256_checksum: [u8; 32],
 }
 
-/// 【UseCase Layer】: 決定論的コンセンサス・ステートマシン（Ed25519 署名付き RPC + 累積ハッシュチェーン + ロック付きマルチシグ QC + ドメイン安全方針ガード + eBPF ブリッジ同期）
+/// 【UseCase Layer】: 決定論的コンセンサス・ステートマシン（Ed25519 署名付き RPC + 累積ハッシュチェーン + ロック付きマルチシグ QC + View-Change TC + TTL 自動失効 + 緊急バイパス + eBPF ブリッジ同期）
 pub struct ConsensusState {
     pub node_id: NodeId,
     pub peers: Vec<NodeId>,
@@ -61,8 +64,26 @@ pub struct ConsensusState {
     /// 同一 `(term, index)` に対する二重署名（Equivocation / Term Sandwich 攻撃）を防ぐ投票履歴レジストリ
     pub voted_entry_hashes: BTreeMap<(u64, u64), [u8; 32]>,
 
+    /// 各 Term ごとに収集された View-Change `TimeoutVote` (`term -> TermTimeoutVoteMap`) (v0.4.0)
+    pub timeout_votes: BTreeMap<u64, TermTimeoutVoteMap>,
+
+    /// タイムアウト投票に添付された検証済み最高位 QC のキャッシュ (`term -> QuorumCertificate`) (v0.4.0)
+    pub highest_observed_qc: Option<QuorumCertificate>,
+
+    /// 直近で成立した View-Change `TimeoutCertificate` (`term -> TimeoutCertificate`) (v0.4.0)
+    pub timeout_certificates: BTreeMap<u64, TimeoutCertificate>,
+
     /// 確定（Commit & Apply）したコンセンサス結果から同期される eBPF `PEER_POLICY_MAP` のミラー状態
     pub ebpf_policy_map: BTreeMap<u32, PeerPolicy>,
+
+    /// 各遮断・信頼ルールの単調増加クロック上の失効時刻ナノ秒 (`peer_ip -> deadline_ns`) (v0.5.0)
+    pub peer_rule_deadlines_ns: BTreeMap<u32, u64>,
+
+    /// ノード内部の単調増加クロック（ナノ秒）。TTL 判定にのみ使用し NTP ステップの影響を受けない (v0.5.0)
+    pub monotonic_now_ns: u64,
+
+    /// 緊急ローカルバイパスフラグ（`true` の間はコンセンサス状態を保持したままローカル XDP 判定を `Pass` に退避する：v0.5.0）
+    pub emergency_local_bypass: bool,
 
     /// 自ノードの LSM ロックダウンポリシー状態 (`LSM_POLICY_MAP[0]`)
     pub lsm_policy: NodeLsmPolicy,
@@ -131,7 +152,13 @@ impl ConsensusState {
             qc_votes: BTreeMap::new(),
             commit_qcs: BTreeMap::new(),
             voted_entry_hashes: BTreeMap::new(),
+            timeout_votes: BTreeMap::new(),
+            highest_observed_qc: None,
+            timeout_certificates: BTreeMap::new(),
             ebpf_policy_map: BTreeMap::new(),
+            peer_rule_deadlines_ns: BTreeMap::new(),
+            monotonic_now_ns: 0,
+            emergency_local_bypass: false,
             lsm_policy: NodeLsmPolicy::new(false, 0),
             ebpf_bridge: None,
             last_apply_error: None,
@@ -473,6 +500,178 @@ impl ConsensusState {
                 );
                 None
             }
+
+            ConsensusRpc::TimeoutVote {
+                term,
+                voter_id,
+                highest_qc,
+                tc_vote_signature,
+            } => {
+                self.on_timeout_vote(term, voter_id, highest_qc, tc_vote_signature);
+                None
+            }
+        }
+    }
+
+    /// 指定された Term における決定論的ラウンドロビン・リーダー `NodeId` を算出する (v0.4.0 View-Change)
+    pub fn deterministic_leader_for_term(&self, term: u64) -> NodeId {
+        let mut all_nodes = self.peers.clone();
+        all_nodes.push(self.node_id.clone());
+        all_nodes.sort();
+        all_nodes.dedup();
+        let idx = ((term.saturating_sub(1)) as usize) % all_nodes.len();
+        all_nodes[idx].clone()
+    }
+
+    /// リーダー沈黙・検閲検知時に現在の Term に対する `TimeoutVote` を生成・署名し、自ノードにも登録する (v0.4.0)
+    pub fn trigger_view_timeout(&mut self) -> SignedConsensusRpc {
+        if self.current_term == 0 {
+            self.current_term = 1;
+        }
+        let target_term = self.current_term;
+        let highest_qc = self
+            .commit_qcs
+            .values()
+            .max_by_key(|qc| (qc.term, qc.index))
+            .cloned();
+        let (high_qc_term, high_qc_index) = highest_qc
+            .as_ref()
+            .map(|qc| (qc.term, qc.index))
+            .unwrap_or((0, 0));
+        let sig = self
+            .identity
+            .sign_timeout_vote(target_term, high_qc_term, high_qc_index);
+        let rpc = ConsensusRpc::TimeoutVote {
+            term: target_term,
+            voter_id: self.node_id.clone(),
+            highest_qc: highest_qc.clone(),
+            tc_vote_signature: sig.clone(),
+        };
+        self.on_timeout_vote(target_term, self.node_id.clone(), highest_qc, sig);
+        self.sign_rpc(rpc)
+    }
+
+    /// `TimeoutCertificate` (TC) のマルチシグ定足数と添付 QC の正当性を検証する (v0.4.0)
+    pub fn verify_timeout_certificate(&self, tc: &TimeoutCertificate) -> Result<(), &'static str> {
+        if tc.term == 0 || tc.term >= MAX_SAFE_TERM {
+            return Err("Byzantine TC Invalid: term out of valid bounds");
+        }
+        if let Some(ref qc) = tc.highest_qc {
+            self.verify_qc_signatures_only(qc)?;
+        }
+        let mut valid_voters = BTreeSet::new();
+        for (voter_id, (hq_term, hq_idx, sig_bytes)) in &tc.votes {
+            let pk_bytes = self
+                .peer_public_keys
+                .get(voter_id)
+                .ok_or("Byzantine TC Invalid: unknown voter inside TimeoutCertificate")?;
+            let payload = timeout_vote_payload(tc.term, *hq_term, *hq_idx);
+            if !NodeCryptoIdentity::verify_signature(pk_bytes, &payload, sig_bytes) {
+                return Err(
+                    "Byzantine TC Forgery Detected: Invalid Ed25519 signature in TimeoutCertificate",
+                );
+            }
+            valid_voters.insert(voter_id.clone());
+        }
+        if valid_voters.len() < self.quorum_size() {
+            return Err("Byzantine TC Invalid: lacks required 2f+1 quorum signatures");
+        }
+        Ok(())
+    }
+
+    /// 検証済み `TimeoutCertificate` を適用して強制的に View-Change (`tc.term + 1`) を完了させ、
+    /// ラウンドロビン次期リーダーを確定させる (v0.4.0)
+    pub fn apply_timeout_certificate(
+        &mut self,
+        tc: TimeoutCertificate,
+    ) -> Result<NodeId, &'static str> {
+        if let Err(e) = self.verify_timeout_certificate(&tc) {
+            self.rejected_byzantine_packets += 1;
+            return Err(e);
+        }
+        let next_term = (tc.term + 1).min(MAX_SAFE_TERM);
+        let next_leader = self.deterministic_leader_for_term(next_term);
+        self.timeout_certificates.insert(tc.term, tc);
+
+        if next_term >= self.current_term {
+            self.current_term = next_term;
+            self.voted_for = Some(next_leader.clone());
+            self.votes_received.clear();
+            if next_leader == self.node_id {
+                self.become_leader();
+            } else {
+                self.role = Role::Follower;
+                self.leader_id = Some(next_leader.clone());
+            }
+        }
+        Ok(next_leader)
+    }
+
+    fn on_timeout_vote(
+        &mut self,
+        term: u64,
+        voter_id: NodeId,
+        highest_qc: Option<QuorumCertificate>,
+        tc_vote_signature: Vec<u8>,
+    ) {
+        if term == 0 || term >= MAX_SAFE_TERM {
+            self.rejected_byzantine_packets += 1;
+            return;
+        }
+        if voter_id != self.node_id && !self.peers.contains(&voter_id) {
+            self.rejected_byzantine_packets += 1;
+            return;
+        }
+        if let Some(ref qc) = highest_qc {
+            if self.verify_qc_signatures_only(qc).is_err() {
+                self.rejected_byzantine_packets += 1;
+                return;
+            }
+        }
+        let (hq_term, hq_idx) = highest_qc
+            .as_ref()
+            .map(|qc| (qc.term, qc.index))
+            .unwrap_or((0, 0));
+        let pk_bytes = match self.peer_public_keys.get(&voter_id) {
+            Some(pk) => pk,
+            None => {
+                self.rejected_byzantine_packets += 1;
+                return;
+            }
+        };
+        let payload = timeout_vote_payload(term, hq_term, hq_idx);
+        if !NodeCryptoIdentity::verify_signature(pk_bytes, &payload, &tc_vote_signature) {
+            self.rejected_byzantine_packets += 1;
+            return;
+        }
+
+        if let Some(qc) = highest_qc {
+            let replace = match &self.highest_observed_qc {
+                None => true,
+                Some(cur) => (qc.term, qc.index) > (cur.term, cur.index),
+            };
+            if replace {
+                self.highest_observed_qc = Some(qc);
+            }
+        }
+
+        let quorum = self.quorum_size();
+        let maybe_tc = {
+            let votes_for_term = self.timeout_votes.entry(term).or_default();
+            votes_for_term.insert(voter_id, (hq_term, hq_idx, tc_vote_signature));
+            if votes_for_term.len() >= quorum {
+                Some(TimeoutCertificate {
+                    term,
+                    highest_qc: self.highest_observed_qc.clone(),
+                    votes: votes_for_term.clone(),
+                })
+            } else {
+                None
+            }
+        };
+
+        if let Some(tc) = maybe_tc {
+            let _ = self.apply_timeout_certificate(tc);
         }
     }
 
@@ -792,21 +991,58 @@ impl ConsensusState {
         self.apply_committed_entries();
     }
 
+    fn apply_peer_rule_internal(
+        &mut self,
+        rule: &PeerTrustRule,
+        applied_index: u32,
+    ) -> Result<(), String> {
+        let policy = PeerPolicy::new(rule.trusted, applied_index);
+        if let Some(ref bridge) = self.ebpf_bridge {
+            bridge
+                .sync_peer_policy(rule.peer_ip, policy)
+                .map_err(|e| e.to_string())?;
+        }
+        self.ebpf_policy_map.insert(rule.peer_ip, policy);
+        if rule.ttl_secs > 0 {
+            let ttl_ns = (rule.ttl_secs as u64).saturating_mul(1_000_000_000);
+            let deadline_ns = self.monotonic_now_ns.saturating_add(ttl_ns);
+            self.peer_rule_deadlines_ns
+                .insert(rule.peer_ip, deadline_ns);
+        } else {
+            self.peer_rule_deadlines_ns.remove(&rule.peer_ip);
+        }
+        Ok(())
+    }
+
     fn apply_committed_entries(&mut self) {
         while self.last_applied < self.commit_index {
             let next_apply = self.last_applied + 1;
-            let entry = &self.log[(next_apply - 1) as usize];
+            let entry = self.log[(next_apply - 1) as usize].clone();
             match &entry.command {
                 MeshCommand::SetPeerTrust { peer_ip, trusted } => {
-                    let policy = PeerPolicy::new(*trusted, entry.index as u32);
+                    let rule = PeerTrustRule {
+                        peer_ip: *peer_ip,
+                        trusted: *trusted,
+                        ttl_secs: 0,
+                    };
                     // R4 対策: カーネル eBPF ブリッジへの書き込み結果を先に確認し、失敗時は last_applied を進めずエラーを記録する
-                    if let Some(ref bridge) = self.ebpf_bridge {
-                        if let Err(err) = bridge.sync_peer_policy(*peer_ip, policy) {
-                            self.last_apply_error = Some(err.to_string());
+                    if let Err(err) = self.apply_peer_rule_internal(&rule, entry.index as u32) {
+                        self.last_apply_error = Some(err);
+                        break;
+                    }
+                }
+                MeshCommand::SetPeerTrustBatch { rules } => {
+                    let mut failed_err = None;
+                    for rule in rules {
+                        if let Err(err) = self.apply_peer_rule_internal(rule, entry.index as u32) {
+                            failed_err = Some(err);
                             break;
                         }
                     }
-                    self.ebpf_policy_map.insert(*peer_ip, policy);
+                    if let Some(err) = failed_err {
+                        self.last_apply_error = Some(err);
+                        break;
+                    }
                 }
                 MeshCommand::SetNodeLockdown {
                     target_node,
@@ -830,8 +1066,95 @@ impl ConsensusState {
         }
     }
 
+    /// 単調増加クロックを `delta_secs` 秒進め、期限切れの遮断・信頼ポリシーを自動失効（GC）させる (v0.5.0)
+    pub fn advance_monotonic_clock(&mut self, delta_secs: u64) -> usize {
+        let delta_ns = delta_secs.saturating_mul(1_000_000_000);
+        self.monotonic_now_ns = self.monotonic_now_ns.saturating_add(delta_ns);
+        self.expire_stale_policies()
+    }
+
+    /// 現在の `monotonic_now_ns` を基準に TTL 期限切れのルールを回収し、カーネル eBPF マップからもエントリを除去する (v0.5.0)
+    pub fn expire_stale_policies(&mut self) -> usize {
+        let now = self.monotonic_now_ns;
+        let expired_ips: Vec<u32> = self
+            .peer_rule_deadlines_ns
+            .iter()
+            .filter_map(|(&ip, &deadline)| if now >= deadline { Some(ip) } else { None })
+            .collect();
+
+        let mut removed = 0;
+        for ip in expired_ips {
+            let default_pass = PeerPolicy::new(true, self.last_applied as u32);
+            if let Some(ref bridge) = self.ebpf_bridge {
+                if let Err(err) = bridge.sync_peer_policy(ip, default_pass) {
+                    self.last_apply_error = Some(err.to_string());
+                    continue;
+                }
+            }
+            self.peer_rule_deadlines_ns.remove(&ip);
+            self.ebpf_policy_map.remove(&ip);
+            removed += 1;
+        }
+        removed
+    }
+
+    /// 緊急ローカルバイパス (`veil-ctl bypass-local on|off` 相当) を切り替える (v0.5.0)
+    pub fn set_emergency_local_bypass(&mut self, enabled: bool) {
+        self.emergency_local_bypass = enabled;
+    }
+
+    /// Prometheus 互換のメトリクス文字列を出力する (v0.5.0 可観測性)
+    pub fn render_prometheus_metrics(&self) -> String {
+        let blocked_count = self
+            .ebpf_policy_map
+            .values()
+            .filter(|p| p.trusted == 0)
+            .count();
+        let degraded = u8::from(self.last_apply_error.is_some());
+        let bypass = u8::from(self.emergency_local_bypass);
+        format!(
+            "# HELP veil_consensus_term Current BFT consensus term\n\
+             # TYPE veil_consensus_term gauge\n\
+             veil_consensus_term{{node=\"{node}\"}} {term}\n\
+             # HELP veil_consensus_commit_index Highest committed log index\n\
+             # TYPE veil_consensus_commit_index gauge\n\
+             veil_consensus_commit_index{{node=\"{node}\"}} {commit}\n\
+             # HELP veil_consensus_last_applied Highest kernel-applied log index\n\
+             # TYPE veil_consensus_last_applied gauge\n\
+             veil_consensus_last_applied{{node=\"{node}\"}} {applied}\n\
+             # HELP veil_ebpf_blocked_ips Active blocked IP count in PEER_POLICY_MAP\n\
+             # TYPE veil_ebpf_blocked_ips gauge\n\
+             veil_ebpf_blocked_ips{{node=\"{node}\"}} {blocked}\n\
+             # HELP veil_rejected_byzantine_packets_total Total rejected Byzantine/malformed RPC packets\n\
+             # TYPE veil_rejected_byzantine_packets_total counter\n\
+             veil_rejected_byzantine_packets_total{{node=\"{node}\"}} {rejected}\n\
+             # HELP veil_node_degraded Kernel eBPF synchronization degraded flag (1=degraded, 0=healthy)\n\
+             # TYPE veil_node_degraded gauge\n\
+             veil_node_degraded{{node=\"{node}\"}} {degraded}\n\
+             # HELP veil_emergency_local_bypass Emergency local XDP bypass flag (1=bypass, 0=enforcing)\n\
+             # TYPE veil_emergency_local_bypass gauge\n\
+             veil_emergency_local_bypass{{node=\"{node}\"}} {bypass}\n",
+            node = self.node_id,
+            term = self.current_term,
+            commit = self.commit_index,
+            applied = self.last_applied,
+            blocked = blocked_count,
+            rejected = self.rejected_byzantine_packets,
+            degraded = degraded,
+            bypass = bypass,
+        )
+    }
+
     pub fn check_xdp_packet(&self, src_ip: Ipv4Addr) -> XdpVerdict {
+        if self.emergency_local_bypass {
+            return XdpVerdict::Pass;
+        }
         let ip_u32 = u32::from(src_ip);
+        if let Some(&deadline) = self.peer_rule_deadlines_ns.get(&ip_u32) {
+            if self.monotonic_now_ns >= deadline {
+                return XdpVerdict::Pass;
+            }
+        }
         let policy = self.ebpf_policy_map.get(&ip_u32);
         evaluate_peer_policy(policy)
     }

@@ -33,19 +33,19 @@
 
 This project is an **experimental prototype exploring consensus-driven eBPF policy enforcement**. Below is an honest breakdown of what is cryptographically enforced and tested in code (`proof_1`–`proof_11`), alongside current limitations.
 
-### 1. Verified Protections in Code (`proof_1`–`proof_11`)
+### 1. Verified Protections in Code (`proof_1`–`proof_14` + `regression_r1`–`r10`)
 
 | Threat Scenario | Enforcement Status | Implementation & Regression Proof |
 | :--- | :---: | :--- |
-| **Unsigned, spoofed, or tampered RPCs on the QUIC wire** | **Enforced & Tested** | `WireMessage::Consensus` exclusively carries `SignedConsensusRpc`, and [`handle_connection`](veil-node/src/main.rs) always validates messages via [`handle_signed_rpc`](veil-node/src/consensus.rs) (`proof_5`, `proof_9`). |
-| **Untrusted TLS peers** | **Enforced & Tested** | `SkipServerVerification` has been removed. [`ClusterMtlsPki`](veil-node/src/main.rs) enforces mutual TLS 1.3 (`WebPkiClientVerifier` + pinned `RootCertStore`) for both client and server certificates (`proof_9`). |
-| **Unilateral leader commit (`commit_qc: None`) or leader equivocation** | **Enforced & Tested** | Followers strictly require a valid [`QuorumCertificate`](veil-node/src/consensus.rs) with $\ge \lfloor 2N/3 \rfloor + 1$ (3 of 4) Ed25519 signatures over `(term, index, entry_hash)` before advancing `commit_index` (`proof_8`). |
-| **Lying follower `match_index` responses** | **Enforced & Tested** | `AppendEntriesResponse` carries `entry_hash` and `qc_vote_signature`. The leader verifies both the hash and the follower's Ed25519 signature before counting the vote (`proof_10`). |
-| **Boundary attacks (`index = 0` panic / `term = u64::MAX` saturation)** | **Enforced & Tested** | Pre-validation safely rejects `index == 0`, non-contiguous indices, and `term > MAX_SAFE_TERM` without panicking or saturating `current_term` (`proof_11`). |
+| **Unsigned, spoofed, or tampered RPCs on the QUIC wire** | **Enforced & Tested** | `WireMessage::Consensus` exclusively carries `SignedConsensusRpc`, and [`handle_connection`](veil-node/src/infra/quic_mtls.rs) always validates messages via [`handle_signed_rpc`](veil-node/src/usecase/consensus_engine.rs) (`proof_5`, `proof_9`). |
+| **Untrusted TLS peers & Multi-Process Shared Root CA** | **Enforced & Tested** | [`ClusterMtlsPki`](veil-node/src/infra/quic_mtls.rs) enforces mutual TLS 1.3 and supports shared multi-process PKI, peer public key auto-discovery, and Crash-Recovery WAL (`proof_9`, `regression_r3`, `regression_wal`). |
+| **Prefix tampering via tail QC (R1) & Cross-term conflicting commits (R2)** | **Enforced & Tested** | Cumulative hash chaining ([`digest_with_parent`](veil-node/src/domain/entities.rs)), Voted-Entry Locks, and double-vote prevention (`voted_entry_hashes`) prevent conflicting commits (`proof_8`, `regression_r1`, `regression_r2`). |
+| **Silent/censoring leader stalls (View-Change)** | **Enforced & Tested** | $\lfloor 2N/3 \rfloor + 1$ `TimeoutVote`s form a [`TimeoutCertificate`](veil-node/src/domain/entities.rs) (TC) to deterministically rotate to the next round-robin leader (`proof_12`, `proof_14`). |
+| **Relative TTL auto-expiry, micro-batching & emergency local bypass** | **Enforced & Tested** | Monotonic-clock TTL auto-expiry, `SetPeerTrustBatch` (up to 128 rules), emergency local bypass, and Prometheus metrics are implemented and verified (`proof_13`). |
+| **Boundary attacks (`index = 0` / `term >= MAX_SAFE_TERM`), `0600` key perms & chunking** | **Enforced & Tested** | Pre-validation rejects out-of-bounds indices/terms, enforces `0600` key permissions, and chunks catch-up batches (`proof_11`, `regression_r8`, `regression_r9`, `regression_r10`). |
 
 ### 2. Known Limitations & Out-of-Scope Risks
 
-- **No Full BFT View-Change / Pacemaker Yet**: While safety against equivocation and unilateral commits is enforced via Ed25519 `QuorumCertificate`s, the leader election and replication loop is still based on Raft without a PBFT/HotStuff-style view-change timer. A compromised leader that silently stalls can delay liveness until manual or external intervention.
 - **Real Kernel XDP vs. Simulated User-Space LSM/Stealth GC**: The IPv4 `XDP_DROP` packet filter (`veil_xdp_kern.c` / `PEER_POLICY_MAP`) is tested on a live Linux kernel (`proof_7`), whereas the LSM `socket_connect` lockdown and Stealth GC key zeroization are currently simulated in user space via `MockEbpfBridge`.
 - **IPv4-Only XDP & Source IP Spoofing**: The current XDP program inspects IPv4 source addresses (`src_ip`) only (IPv6 passes through). Because L3 source IPs can be spoofed in raw UDP packets, production deployments should feed consensus proposals from authenticated L7 WAF or TCP-established host sensors ([`veil-warden`](https://github.com/mt4110/veil-warden)) rather than unverified UDP source IPs.
 - **Shared Credentials & Host Root Compromise**: Consensus cannot prevent data exfiltration inside a node where `root` is already compromised, nor can it survive simultaneous compromise of $\ge 2f+1$ nodes sharing identical admin credentials.

@@ -4,11 +4,32 @@ use std::net::Ipv4Addr;
 
 pub type NodeId = String;
 
+/// TTL 付きピア信頼・遮断ルール（マイクロバッチ合意 `SetPeerTrustBatch` 用）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTrustRule {
+    pub peer_ip: u32,
+    pub trusted: bool,
+    /// 相対有効期限（秒）。`0` の場合は明示解除まで維持、`> 0` の場合は単調増加クロックで `ttl_secs` 経過後に自動失効
+    pub ttl_secs: u32,
+}
+
+impl PeerTrustRule {
+    pub fn new(ip: Ipv4Addr, trusted: bool, ttl_secs: u32) -> Self {
+        Self {
+            peer_ip: u32::from(ip),
+            trusted,
+            ttl_secs,
+        }
+    }
+}
+
 /// メッシュネットワーク内で合意対象となるコマンド（eBPF XDP 遮断ポリシー & LSM 制御）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MeshCommand {
     /// ピアの信頼状態（`XDP_PASS` / `XDP_DROP`）を合意によって更新する
     SetPeerTrust { peer_ip: u32, trusted: bool },
+    /// 複数のピア信頼ルール（TTL 付き）をマイクロバッチで一括合意・更新する（v0.5.0）
+    SetPeerTrustBatch { rules: Vec<PeerTrustRule> },
     /// 特定ノード（または全ノード）の LSM ロックダウンを発動・解除する
     SetNodeLockdown { target_node: NodeId, lockdown: bool },
     /// リーダーによる定期的な生存確認とコミット進行用の NoOp
@@ -21,6 +42,16 @@ impl MeshCommand {
             peer_ip: u32::from(ip),
             trusted,
         }
+    }
+
+    pub fn set_trust_with_ttl(ip: Ipv4Addr, trusted: bool, ttl_secs: u32) -> Self {
+        Self::SetPeerTrustBatch {
+            rules: vec![PeerTrustRule::new(ip, trusted, ttl_secs)],
+        }
+    }
+
+    pub fn set_trust_batch(rules: Vec<PeerTrustRule>) -> Self {
+        Self::SetPeerTrustBatch { rules }
     }
 
     pub fn set_lockdown(target_node: impl Into<String>, lockdown: bool) -> Self {
@@ -83,6 +114,25 @@ pub fn qc_vote_payload(term: u64, index: u64, entry_hash: &[u8; 32]) -> Vec<u8> 
     buf
 }
 
+/// リーダーの沈黙・検閲時に View-Change（Term 強制進行）を駆動する `TimeoutVote` 署名対象ペイロード（v0.4.0）
+pub fn timeout_vote_payload(term: u64, high_qc_term: u64, high_qc_index: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + 8 + 8 + 8);
+    buf.extend_from_slice(b"VEIL_TC_VOTE_V1:");
+    buf.extend_from_slice(&term.to_be_bytes());
+    buf.extend_from_slice(&high_qc_term.to_be_bytes());
+    buf.extend_from_slice(&high_qc_index.to_be_bytes());
+    buf
+}
+
+/// $\lfloor 2N/3 \rfloor + 1$ 台のノードが特定 Term のタイムアウトに合意したことを証明する View-Change 証明書 (`TimeoutCertificate`: TC)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutCertificate {
+    pub term: u64,
+    pub highest_qc: Option<QuorumCertificate>,
+    /// `voter_id -> (high_qc_term, high_qc_index, Ed25519 Signature)`
+    pub votes: BTreeMap<NodeId, (u64, u64, Vec<u8>)>,
+}
+
 /// QUIC 双方向ストリーム上で交換されるコンセンサス RPC メッセージ
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusRpc {
@@ -120,6 +170,13 @@ pub enum ConsensusRpc {
         /// フォロワーが `(term, match_index, entry_hash)` に対して署名した Ed25519 QC 投票署名
         qc_vote_signature: Vec<u8>,
     },
+    /// リーダー沈黙・検閲時にフォロワーがブロードキャストする View-Change タイムアウト投票 (v0.4.0)
+    TimeoutVote {
+        term: u64,
+        voter_id: NodeId,
+        highest_qc: Option<QuorumCertificate>,
+        tc_vote_signature: Vec<u8>,
+    },
 }
 
 impl ConsensusRpc {
@@ -130,6 +187,7 @@ impl ConsensusRpc {
             ConsensusRpc::RequestVoteResponse { voter_id, .. } => voter_id,
             ConsensusRpc::AppendEntries { leader_id, .. } => leader_id,
             ConsensusRpc::AppendEntriesResponse { follower_id, .. } => follower_id,
+            ConsensusRpc::TimeoutVote { voter_id, .. } => voter_id,
         }
     }
 
@@ -139,7 +197,8 @@ impl ConsensusRpc {
             ConsensusRpc::RequestVote { term, .. }
             | ConsensusRpc::RequestVoteResponse { term, .. }
             | ConsensusRpc::AppendEntries { term, .. }
-            | ConsensusRpc::AppendEntriesResponse { term, .. } => *term,
+            | ConsensusRpc::AppendEntriesResponse { term, .. }
+            | ConsensusRpc::TimeoutVote { term, .. } => *term,
         }
     }
 }

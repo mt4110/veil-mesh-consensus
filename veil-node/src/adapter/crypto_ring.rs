@@ -1,4 +1,6 @@
-use crate::domain::{qc_vote_payload, ConsensusRpc, NodeId, SignedConsensusRpc};
+use crate::domain::{
+    qc_vote_payload, timeout_vote_payload, ConsensusRpc, NodeId, SignedConsensusRpc,
+};
 use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 
 /// 【Interface Adapter】: `ring` による Ed25519 署名鍵ペア管理（OS 乱数生成および `0600` 鍵ファイル永続化）
@@ -132,6 +134,12 @@ impl NodeCryptoIdentity {
     /// 特定のログエントリ `(term, index, entry_hash)` に対する QC 投票署名を計算する
     pub fn sign_qc_vote(&self, term: u64, index: u64, entry_hash: &[u8; 32]) -> Vec<u8> {
         let payload = qc_vote_payload(term, index, entry_hash);
+        self.keypair.sign(&payload).as_ref().to_vec()
+    }
+
+    /// View-Change 用の `TimeoutVote` `(term, high_qc_term, high_qc_index)` 署名を計算する（v0.4.0）
+    pub fn sign_timeout_vote(&self, term: u64, high_qc_term: u64, high_qc_index: u64) -> Vec<u8> {
+        let payload = timeout_vote_payload(term, high_qc_term, high_qc_index);
         self.keypair.sign(&payload).as_ref().to_vec()
     }
 

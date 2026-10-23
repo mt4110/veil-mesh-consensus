@@ -8,6 +8,12 @@ pub const MAX_SAFE_TERM: u64 = u64::MAX / 2;
 /// 1回の `AppendEntries` RPC に含められる最大ログエントリ数（メモリ枯渇 DoS 防止）
 pub const MAX_LOG_ENTRIES_PER_RPC: usize = 1024;
 
+/// 1回の `SetPeerTrustBatch` コマンドに含められる最大ルール数（50ms マイクロバッチ上限）
+pub const MAX_BATCH_RULES_PER_COMMAND: usize = 128;
+
+/// 許容される最大 TTL 秒数（24時間 = 86,400秒）
+pub const MAX_POLICY_TTL_SECS: u32 = 86_400;
+
 /// QUIC ストリーム上で許容する最大メッセージサイズ（64 KiB）
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024;
 
@@ -37,14 +43,29 @@ impl SecurityPolicyGuard {
 
     /// 提案されたコマンドがドメインの安全方針に違反していないか検証する
     pub fn validate_command(&self, cmd: &MeshCommand) -> Result<(), &'static str> {
-        if let MeshCommand::SetPeerTrust {
-            peer_ip,
-            trusted: false,
-        } = cmd
-        {
-            if self.protected_ips.contains(peer_ip) {
+        match cmd {
+            MeshCommand::SetPeerTrust {
+                peer_ip,
+                trusted: false,
+            } if self.protected_ips.contains(peer_ip) => {
                 return Err("Policy Violation: Cannot block a protected/loopback IP address");
             }
+            MeshCommand::SetPeerTrustBatch { rules } => {
+                if rules.is_empty() || rules.len() > MAX_BATCH_RULES_PER_COMMAND {
+                    return Err("Policy Violation: Batch rules count out of bounds (1..=128)");
+                }
+                for rule in rules {
+                    if !rule.trusted && self.protected_ips.contains(&rule.peer_ip) {
+                        return Err(
+                            "Policy Violation: Batch contains a protected/loopback IP address",
+                        );
+                    }
+                    if rule.ttl_secs > MAX_POLICY_TTL_SECS {
+                        return Err("Policy Violation: Rule TTL exceeds MAX_POLICY_TTL_SECS");
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

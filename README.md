@@ -78,20 +78,19 @@ flowchart LR
 
 本リポジトリは「Raft ベースの合意アルゴリズムに Ed25519 署名検証とマルチシグ `QuorumCertificate` (QC) を組み込み、eBPF マップと連動させる実験的プロトタイプ」です。コードで実際に検証されている範囲と、現時点での未検証・構造的な限界を正直に明記します。
 
-### 1. 実装・回帰テストで検証済みの項目 (`proof_1` 〜 `proof_11`)
+### 1. 実装・回帰テストで検証済みの項目 (`proof_1` 〜 `proof_14` + `regression_r1` 〜 `r10`)
 
 | 脅威・検証項目 | 対策の実装状況 | 実装箇所と根拠テスト |
 | :--- | :---: | :--- |
-| **ネットワーク経路での未署名・改ざん・なりすまし RPC** | **実装・検証済み** | QUIC 受信ハンドラ（[`handle_connection`](veil-node/src/main.rs)）は `WireMessage::Consensus(SignedConsensusRpc)` のみを受け付け、必ず [`handle_signed_rpc`](veil-node/src/consensus.rs) を通して Ed25519 署名を検証します（直接呼び出しによるバイパス不可、`proof_5`, `proof_9`）。 |
-| **TLS 層のなりすまし接続** | **実装・検証済み** | `SkipServerVerification` を廃止し、クラスタ Root CA ピンニングによる相互 TLS 認証（[`ClusterMtlsPki`](veil-node/src/main.rs): `WebPkiClientVerifier` + `RootCertStore`）でサーバー・クライアント双方の証明書を検証します（`proof_9`）。 |
-| **リーダー単独でのコミット強要 (`commit_qc: None`) や二枚舌 (Equivocation)** | **実装・検証済み** | フォロワーが `commit_index` を進める際は $\lfloor 2N/3 \rfloor + 1$ 台（4ノード構成で3台以上）の異なる Ed25519 署名を含む [`QuorumCertificate`](veil-node/src/consensus.rs) を必須とし、`commit_qc: None` のコミット要求は拒否します（`proof_8`）。 |
-| **裏切りフォロワーによる嘘の `match_index` 報告** | **実装・検証済み** | `AppendEntriesResponse` にエントリの SHA-256 ダイジェスト (`entry_hash`) と Ed25519 QC 投票署名 (`qc_vote_signature`) を含め、リーダー側で署名とハッシュの一致を検証してから集計します（`proof_10`）。 |
-| **境界値攻撃 (`index = 0` による Panic / `term = u64::MAX` 飽和)** | **実装・検証済み** | `index == 0` や非連番エントリ、`term == 0` または `term > MAX_SAFE_TERM` の RPC を事前検証で安全に棄却します（`proof_11`）。 |
+| **ネットワーク経路での未署名・改ざん・なりすまし RPC** | **実装・検証済み** | QUIC 受信ハンドラは `WireMessage::Consensus(SignedConsensusRpc)` のみを受け付け、必ず [`handle_signed_rpc`](veil-node/src/usecase/consensus_engine.rs) を通して Ed25519 署名を検証します（`proof_5`, `proof_9`）。 |
+| **TLS 層のなりすまし接続 & 独立プロセス間 PKI** | **実装・検証済み** | クラスタ共有 Root CA ピンニングによる相互 TLS 認証（[`ClusterMtlsPki`](veil-node/src/infra/quic_mtls.rs)）と `--cluster-dir` による公開鍵自動同期・WAL 復元を検証済み（`proof_9`, `regression_r3`, `regression_wal`）。 |
+| **末尾 QC による過去ログ改ざん (R1) & 別 Term の競合確定 (R2)** | **実装・検証済み** | 累積チェーンハッシュ [`digest_with_parent`](veil-node/src/domain/entities.rs) による全プレフィックス束縛と、Voted-Entry Lock・二重署名防止 (`voted_entry_hashes`) により誠実ノード間の分岐確定を防止（`proof_8`, `regression_r1`, `regression_r2`）。 |
+| **悪意あるリーダーの沈黙・検閲攻撃 (View-Change)** | **実装・検証済み** | $\lfloor 2N/3 \rfloor + 1$ 台の `TimeoutVote` から [`TimeoutCertificate`](veil-node/src/domain/entities.rs) (TC) を形成し、ラウンドロビン次期リーダーへ自動交代します（`proof_12`, `proof_14`）。 |
+| **TTL 自動失効・マイクロバッチ・緊急ローカルバイパス** | **実装・検証済み** | 単調増加クロックによる TTL 自動失効、最大128件の `SetPeerTrustBatch`、緊急ローカルバイパス、Prometheus メトリクス出力を実装・検証済み（`proof_13`）。 |
+| **境界値攻撃 (`index = 0` / `term >= MAX_SAFE_TERM`)・鍵権限・チャンク分割** | **実装・検証済み** | `index == 0`、`term >= MAX_SAFE_TERM`、`0600` 以外の秘密鍵拒否、1024件チャンク分割送信を検証済み（`proof_11`, `regression_r8`, `regression_r9`, `regression_r10`）。 |
 
 ### 2. 現時点での実装上の制約・構造的な限界（Known Limitations）
 
-- **完全な BFT View-Change（悪意あるリーダーの沈黙対策）は未実装**:
-  - 現在の合意エンジンは Raft のリーダー選出・ログ複製をベースに Ed25519 署名とマルチシグ `QuorumCertificate` による Safety（不正なコミットの阻止）を追加したものであり、PBFT や HotStuff のような View-Change タイマー / Pacemaker プロトコルはまだ実装していません。そのため、リーダー自身が侵害されて「意図的に何もしない（Liveness 妨害）」場合の自動リーダー交代は今後の課題です。
 - **カーネル実機動作（XDP）とユーザー空間シミュレーション（LSM / Stealth GC）の区別**:
   - IPv4 パケットの `XDP_DROP` フィルタ（[`veil-ebpf/src/veil_xdp_kern.c`](veil-ebpf/src/veil_xdp_kern.c) / `PEER_POLICY_MAP`）は実機 Linux カーネル (`pi-node`) の NIC 上でパケット遮断を実証済み（`proof_7`）です。
   - 一方、LSM (`socket_connect`) 遮断および Stealth GC によるダミー秘密鍵のゼロ消去は、現時点では [`MockEbpfBridge`](veil-node/src/ebpf_bridge.rs) 上でのユーザー空間シミュレーションであり、実カーネルの `BPF_PROG_TYPE_LSM` アタッチおよび実運用秘密鍵との統合は今後のフェーズとなります（本番の LSM プロセス制御は [`veil-warden`](https://github.com/mt4110/veil-warden) 側で実装を進めています）。
