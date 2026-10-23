@@ -1,0 +1,5 @@
+{
+  "rust-analyzer.cargo.overrideCommand": null,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.cargo.extraEnv": {}
+}

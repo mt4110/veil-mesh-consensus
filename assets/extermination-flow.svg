@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 560" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B0F19"/>
+      <stop offset="50%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#EF4444"/>
+      <stop offset="100%" stop-color="#991B1B"/>
+    </linearGradient>
+    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#6D28D9"/>
+    </linearGradient>
+    <filter id="glow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <marker id="arrowCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38BDF8"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#F87171"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34D399"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1120" height="560" rx="18" fill="url(#bgGrad)" stroke="#1E293B" stroke-width="2"/>
+
+  <!-- Title Banner -->
+  <rect x="30" y="22" width="1060" height="56" rx="12" fill="#1E293B" stroke="#334155" stroke-width="1.5" filter="url(#glow)"/>
+  <rect x="44" y="34" width="12" height="32" rx="4" fill="url(#cyanGrad)"/>
+  <text x="68" y="49" fill="#F8FAFC" font-family="system-ui, -apple-system, sans-serif" font-size="18" font-weight="800">
+    VEIL-MESH-CONSENSUS : Autonomous Attack Extermination Pipeline
+  </text>
+  <text x="68" y="68" fill="#94A3B8" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500">
+    QUIC (TLS 1.3) + Ed25519 BFT Raft Consensus + Linux Kernel Aya eBPF (XDP_DROP &amp; LSM Stealth GC)
+  </text>
+
+  <!-- ================= STEP 1: ATTACK INFILTRATION ================= -->
+  <g transform="translate(30, 100)" filter="url(#glow)">
+    <rect width="245" height="360" rx="14" fill="#171923" stroke="#EF4444" stroke-width="1.8"/>
+    <rect x="0" y="0" width="245" height="42" rx="14" fill="url(#redGrad)"/>
+    <text x="16" y="26" fill="#FFFFFF" font-family="system-ui, sans-serif" font-size="14" font-weight="800">
+      1. 攻撃プロセス出現・侵入試行
+    </text>
+
+    <!-- Mock Rogue OS Process Box -->
+    <rect x="18" y="60" width="209" height="88" rx="10" fill="#2D161B" stroke="#F87171" stroke-width="1.2"/>
+    <text x="30" y="82" fill="#FCA5A5" font-family="monospace" font-size="12" font-weight="700">⚠️ Rogue Process (OS PID)</text>
+    <text x="30" y="102" fill="#F8FAFC" font-family="monospace" font-size="12">PID: 48291 (Mock Attack)</text>
+    <text x="30" y="120" fill="#F8FAFC" font-family="monospace" font-size="12">SRC: 10.0.0.91 (UDP Flood)</text>
+    <text x="30" y="136" fill="#F87171" font-family="monospace" font-size="11">Syscall: socket_connect()</text>
+
+    <!-- Byzantine Spoof Box -->
+    <rect x="18" y="166" width="209" height="88" rx="10" fill="#27173A" stroke="#C084FC" stroke-width="1.2"/>
+    <text x="30" y="188" fill="#E9D5FF" font-family="monospace" font-size="12" font-weight="700">🎭 Byzantine Forged RPC</text>
+    <text x="30" y="208" fill="#F8FAFC" font-family="monospace" font-size="11">Spoof: leader="node-alpha"</text>
+    <text x="30" y="226" fill="#F8FAFC" font-family="monospace" font-size="11">Tamper: trusted=false→true</text>
+    <text x="30" y="244" fill="#C084FC" font-family="monospace" font-size="11">Sig: Invalid Ed25519 Key</text>
+
+    <!-- Detection Badge -->
+    <rect x="18" y="272" width="209" height="68" rx="10" fill="#1E293B" stroke="#475569"/>
+    <text x="30" y="295" fill="#38BDF8" font-family="system-ui, sans-serif" font-size="12" font-weight="700">🔍 Anomaly &amp; Crypto Guard</text>
+    <text x="30" y="314" fill="#CBD5E1" font-family="system-ui, sans-serif" font-size="11">・偽造署名を Ed25519 で即座に破棄</text>
+    <text x="30" y="330" fill="#CBD5E1" font-family="system-ui, sans-serif" font-size="11">・攻撃IPと侵害ノードを合意提案へ</text>
+  </g>
+
+  <!-- Arrow 1 -> 2 -->
+  <line x1="278" y1="280" x2="306" y2="280" stroke="#F87171" stroke-width="3" marker-end="url(#arrowRed)"/>
+
+  <!-- ================= STEP 2: QUIC + ED25519 RAFT CONSENSUS ================= -->
+  <g transform="translate(312, 100)" filter="url(#glow)">
+    <rect width="265" height="360" rx="14" fill="#171923" stroke="#3B82F6" stroke-width="1.8"/>
+    <rect x="0" y="0" width="265" height="42" rx="14" fill="url(#cyanGrad)"/>
+    <text x="16" y="26" fill="#FFFFFF" font-family="system-ui, sans-serif" font-size="14" font-weight="800">
+      2. QUIC メッシュ合意 (Raft BFT)
+    </text>
+
+    <!-- Leader Node -->
+    <rect x="20" y="58" width="225" height="68" rx="10" fill="#0F2942" stroke="#38BDF8" stroke-width="1.5"/>
+    <text x="32" y="80" fill="#38BDF8" font-family="monospace" font-size="12" font-weight="700">★ node-alpha (LEADER / Term 1)</text>
+    <text x="32" y="98" fill="#E2E8F0" font-family="monospace" font-size="11">propose(SetPeerTrust(10.0.0.91, 0))</text>
+    <text x="32" y="114" fill="#E2E8F0" font-family="monospace" font-size="11">propose(SetNodeLockdown(beta, 1))</text>
+
+    <!-- Followers -->
+    <rect x="20" y="142" width="106" height="64" rx="10" fill="#1E293B" stroke="#64748B"/>
+    <text x="30" y="164" fill="#93C5FD" font-family="monospace" font-size="11" font-weight="700">node-beta</text>
+    <text x="30" y="182" fill="#CBD5E1" font-family="monospace" font-size="10">Ed25519 Verify ✓</text>
+    <text x="30" y="196" fill="#34D399" font-family="monospace" font-size="10">ACK (Match=2)</text>
+
+    <rect x="139" y="142" width="106" height="64" rx="10" fill="#1E293B" stroke="#64748B"/>
+    <text x="149" y="164" fill="#93C5FD" font-family="monospace" font-size="11" font-weight="700">node-gamma</text>
+    <text x="149" y="182" fill="#CBD5E1" font-family="monospace" font-size="10">Ed25519 Verify ✓</text>
+    <text x="149" y="196" fill="#34D399" font-family="monospace" font-size="10">ACK (Match=2)</text>
+
+    <!-- Quorum Box -->
+    <rect x="20" y="222" width="225" height="120" rx="10" fill="#131C31" stroke="#8B5CF6" stroke-width="1.4"/>
+    <text x="32" y="245" fill="#C4B5FD" font-family="system-ui, sans-serif" font-size="12" font-weight="700">⚡ Quorum Commit (3/3 合意成立)</text>
+    <text x="32" y="266" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">・UDP 5000 (QUIC TLS 1.3) 双方向通信</text>
+    <text x="32" y="284" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">・Split-Brain 防止 (少数派はCommit不可)</text>
+    <text x="32" y="302" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">・全ノード同時に commit_index = 2 へ</text>
+    <text x="32" y="322" fill="#34D399" font-family="monospace" font-size="11" font-weight="700">→ apply_committed_entries() 発火!</text>
+  </g>
+
+  <!-- Arrow 2 -> 3 -->
+  <line x1="580" y1="280" x2="608" y2="280" stroke="#38BDF8" stroke-width="3" marker-end="url(#arrowCyan)"/>
+
+  <!-- ================= STEP 3: KERNEL EBPF & LSM ENFORCEMENT ================= -->
+  <g transform="translate(614, 100)" filter="url(#glow)">
+    <rect width="235" height="360" rx="14" fill="#171923" stroke="#8B5CF6" stroke-width="1.8"/>
+    <rect x="0" y="0" width="235" height="42" rx="14" fill="url(#purpleGrad)"/>
+    <text x="16" y="26" fill="#FFFFFF" font-family="system-ui, sans-serif" font-size="14" font-weight="800">
+      3. カーネル eBPF 即時遮断
+    </text>
+
+    <!-- XDP Filter Box -->
+    <rect x="16" y="58" width="203" height="92" rx="10" fill="#1E1B3A" stroke="#A78BFA" stroke-width="1.2"/>
+    <text x="28" y="78" fill="#DDD6FE" font-family="monospace" font-size="12" font-weight="700">🛡️ Aya XDP (eth1 NIC)</text>
+    <text x="28" y="96" fill="#F8FAFC" font-family="monospace" font-size="11">Map: PEER_POLICY_MAP</text>
+    <text x="28" y="114" fill="#F8FAFC" font-family="monospace" font-size="11">Key: 10.0.0.91 → trusted: 0</text>
+    <text x="28" y="134" fill="#F87171" font-family="monospace" font-size="12" font-weight="700">Verdict: XDP_DROP (1)</text>
+
+    <!-- LSM Hook Box -->
+    <rect x="16" y="164" width="203" height="92" rx="10" fill="#1E1B3A" stroke="#A78BFA" stroke-width="1.2"/>
+    <text x="28" y="184" fill="#DDD6FE" font-family="monospace" font-size="12" font-weight="700">🔒 Aya LSM (lsm=bpf)</text>
+    <text x="28" y="202" fill="#F8FAFC" font-family="monospace" font-size="11">Map: LSM_POLICY_MAP[0]</text>
+    <text x="28" y="220" fill="#F8FAFC" font-family="monospace" font-size="11">Hook: socket_connect</text>
+    <text x="28" y="240" fill="#F87171" font-family="monospace" font-size="12" font-weight="700">Verdict: -EPERM (-1)</text>
+
+    <!-- Stealth GC Box -->
+    <rect x="16" y="270" width="203" height="72" rx="10" fill="#112A2A" stroke="#2DD4BF" stroke-width="1.2"/>
+    <text x="28" y="290" fill="#5EEAD4" font-family="monospace" font-size="12" font-weight="700">🧹 Stealth GC Zeroize</text>
+    <text x="28" y="308" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">機密鍵メモリを 0x00 で即時消去</text>
+    <text x="28" y="326" fill="#34D399" font-family="monospace" font-size="11">[0xCA,0xFE..] → [0x00,0x00..]</text>
+  </g>
+
+  <!-- Arrow 3 -> 4 -->
+  <line x1="852" y1="280" x2="880" y2="280" stroke="#34D399" stroke-width="3" marker-end="url(#arrowGreen)"/>
+
+  <!-- ================= STEP 4: COMPLETE EXTERMINATION ================= -->
+  <g transform="translate(886, 100)" filter="url(#glow)">
+    <rect width="204" height="360" rx="14" fill="#171923" stroke="#10B981" stroke-width="1.8"/>
+    <rect x="0" y="0" width="204" height="42" rx="14" fill="url(#greenGrad)"/>
+    <text x="16" y="26" fill="#FFFFFF" font-family="system-ui, sans-serif" font-size="14" font-weight="800">
+      4. 攻撃の完全駆逐・無力化
+    </text>
+
+    <rect x="16" y="60" width="172" height="86" rx="10" fill="#0D281E" stroke="#34D399" stroke-width="1.2"/>
+    <text x="26" y="82" fill="#6EE7B7" font-family="system-ui, sans-serif" font-size="12" font-weight="700">✅ パケット 100% 遮断</text>
+    <text x="26" y="102" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">OS の TCP/IP スタックに</text>
+    <text x="26" y="118" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">届く前に NIC 層で破棄</text>
+    <text x="26" y="136" fill="#34D399" font-family="monospace" font-size="11">CPU Load: ~0%</text>
+
+    <rect x="16" y="162" width="172" height="86" rx="10" fill="#0D281E" stroke="#34D399" stroke-width="1.2"/>
+    <text x="26" y="184" fill="#6EE7B7" font-family="system-ui, sans-serif" font-size="12" font-weight="700">✅ 攻撃プロセス Kill</text>
+    <text x="26" y="204" fill="#E2E8F0" font-family="monospace" font-size="11">PID 48291 → SIGKILL</text>
+    <text x="26" y="222" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">外部通信も LSM で封鎖</text>
+    <text x="26" y="238" fill="#34D399" font-family="monospace" font-size="11">Status: EXTERMINATED</text>
+
+    <rect x="16" y="264" width="172" height="78" rx="10" fill="#0D281E" stroke="#34D399" stroke-width="1.2"/>
+    <text x="26" y="286" fill="#6EE7B7" font-family="system-ui, sans-serif" font-size="12" font-weight="700">✅ 機密漏洩ゼロ保証</text>
+    <text x="26" y="306" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">Stealth GC によりメモリ</text>
+    <text x="26" y="322" fill="#E2E8F0" font-family="system-ui, sans-serif" font-size="11">ダンプされても鍵は空</text>
+  </g>
+
+  <!-- Footer Status Bar -->
+  <rect x="30" y="482" width="1060" height="52" rx="10" fill="#0F172A" stroke="#334155"/>
+  <text x="50" y="513" fill="#38BDF8" font-family="monospace" font-size="13" font-weight="700">
+    $ cargo run -p veil-node -- --tui
+  </text>
+  <text x="360" y="513" fill="#94A3B8" font-family="system-ui, sans-serif" font-size="13">
+    [a] モック攻撃プロセス起動 (OS PID)   →   [b] ビザンチン偽造注入   →   [x] コンセンサス合意 &amp; eBPF 一斉駆逐！
+  </text>
+</svg>

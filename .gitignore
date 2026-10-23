@@ -1,0 +1,11 @@
+/target
+/.direnv
+/result
+/result-*
+/artifacts
+assets/demo.mp4
+*.qcow2
+*.sock
+
+
+

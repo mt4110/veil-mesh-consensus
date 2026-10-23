@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "veil-common",
+    "veil-node",
+    "xtask",
+]
+# veil-ebpf is built via `cargo run -p xtask -- build-ebpf` targeting bpfel-unknown-none
+exclude = [
+    "veil-ebpf",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+aya = "0.13"
+aya-log = "0.2"
+bytes = "1.7"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+quinn = "0.11"
+ratatui = "0.29"
+rcgen = "0.13"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+tokio = { version = "1.40", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+veil-common = { path = "veil-common" }

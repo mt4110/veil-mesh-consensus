@@ -1,0 +1,12 @@
+[package]
+name = "veil-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+user = ["aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }

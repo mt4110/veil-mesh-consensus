@@ -1,0 +1,106 @@
+#![no_std]
+#![no_main]
+
+use aya_ebpf::{
+    bindings::xdp_action,
+    macros::{lsm, map, xdp},
+    maps::{Array, HashMap, PerCpuArray},
+    programs::{LsmContext, XdpContext},
+};
+use core::mem;
+use veil_common::{
+    evaluate_lsm_policy, evaluate_peer_policy, NodeLsmPolicy, PeerPolicy, XdpVerdict,
+};
+
+/// IPv4 アドレス (Network Byte Order / Big Endian `u32`) をキーとするピア信頼ポリシーマップ
+#[map]
+static PEER_POLICY_MAP: HashMap<u32, PeerPolicy> = HashMap::with_max_entries(256, 0);
+
+/// LSM ステルス GC / 隔離ロックダウン制御マップ (`index 0`: 自ノードの `NodeLsmPolicy`)
+#[map]
+static LSM_POLICY_MAP: Array<NodeLsmPolicy> = Array::with_max_entries(1, 0);
+
+/// XDP で処理したパケット数のカウンタ (`index 0`: PASS, `index 1`: DROP)
+#[map]
+static PACKETS_SEEN_MAP: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
+
+const ETH_P_IP: u16 = 0x0800;
+
+#[repr(C)]
+struct EthHdr {
+    h_dest: [u8; 6],
+    h_source: [u8; 6],
+    h_proto: u16,
+}
+
+#[repr(C)]
+struct Ipv4Hdr {
+    version_ihl: u8,
+    tos: u8,
+    tot_len: u16,
+    id: u16,
+    frag_off: u16,
+    ttl: u8,
+    protocol: u8,
+    check: u16,
+    saddr: u32,
+    daddr: u32,
+}
+
+#[inline(always)]
+fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = mem::size_of::<T>();
+
+    if start + offset + len > end {
+        return Err(());
+    }
+
+    Ok((start + offset) as *const T)
+}
+
+#[xdp]
+pub fn veil_xdp_filter(ctx: XdpContext) -> u32 {
+    match try_veil_xdp_filter(ctx) {
+        Ok(ret) => ret,
+        Err(_) => xdp_action::XDP_PASS,
+    }
+}
+
+fn try_veil_xdp_filter(ctx: XdpContext) -> Result<u32, ()> {
+    let eth = unsafe { *ptr_at::<EthHdr>(&ctx, 0)? };
+    if u16::from_be(eth.h_proto) != ETH_P_IP {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let ipv4 = unsafe { *ptr_at::<Ipv4Hdr>(&ctx, mem::size_of::<EthHdr>())? };
+    let src_ip = u32::from_be(ipv4.saddr);
+
+    // マップにポリシーが登録されており、trusted == 0 (Untrusted) の場合は XDP_DROP
+    let policy = unsafe { PEER_POLICY_MAP.get(&src_ip) };
+    if evaluate_peer_policy(policy) == XdpVerdict::Drop {
+        if let Some(drop_cnt) = PACKETS_SEEN_MAP.get_ptr_mut(1) {
+            unsafe { *drop_cnt += 1 };
+        }
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    if let Some(pass_cnt) = PACKETS_SEEN_MAP.get_ptr_mut(0) {
+        unsafe { *pass_cnt += 1 };
+    }
+    Ok(xdp_action::XDP_PASS)
+}
+
+/// LSM フック (`socket_connect`) によるコンセンサス連動型ステルス GC・自己隔離ガード
+/// `LSM_POLICY_MAP[0].lockdown != 0` の場合、カーネルレベルで `-EPERM (-1)` を返して通信を遮断する
+#[lsm(hook = "socket_connect")]
+pub fn veil_lsm_socket_connect(_ctx: LsmContext) -> i32 {
+    let policy = LSM_POLICY_MAP.get(0);
+    evaluate_lsm_policy(policy)
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    unsafe { core::hint::unreachable_unchecked() }
+}

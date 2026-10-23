@@ -1,0 +1,12 @@
+# Configuration for readme-gif-crafter (rgc)
+default_preset = "github"
+
+[presets.github]
+max_width = 1024
+fps = 24
+lossy = 80
+
+[presets.mini]
+max_width = 720
+fps = 15
+lossy = 90

@@ -1,0 +1,86 @@
+{
+  "nodes": {
+    "microvm": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "spectrum": "spectrum"
+      },
+      "locked": {
+        "lastModified": 1791551030,
+        "narHash": "sha256-jTx3O3MKqPjv+cDfBFQ5zlKECBEwzF91scC+mSumZyE=",
+        "owner": "astro",
+        "repo": "microvm.nix",
+        "rev": "f13928fe9900e91709d7ce581eefa47eaafa79e1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "astro",
+        "repo": "microvm.nix",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1792502884,
+        "narHash": "sha256-IoNisKcGbUjdd45qCqywGMCYmZ5EnkxezvLII0FWwNA=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "microvm": "microvm",
+        "nixpkgs": "nixpkgs",
+        "rust-overlay": "rust-overlay"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792653800,
+        "narHash": "sha256-E8zFJilWlORqzIUJizyhZ/0WKBOizuM6s1nRSgPRomo=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "5f267b7f323a4d6df0b9c0e3eaa043cbe85386f2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "spectrum": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786032750,
+        "narHash": "sha256-+Ba/kIn5BjvV7PN8bWOo7RoqgTY/Yv2M7qeMf3wS2Ag=",
+        "ref": "refs/heads/main",
+        "rev": "77d2389874bb092b8dbf05ecc5b1030372e80e98",
+        "revCount": 1417,
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
