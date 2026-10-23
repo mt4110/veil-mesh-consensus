@@ -1,8 +1,8 @@
-# 🧭 `veil-mesh-consensus` v1.0 実践アーキテクチャ設計書 & 運用ロードマップ
+# 🧭 `veil-mesh-consensus` v0.9.1 実践アーキテクチャ設計書 & 運用ロードマップ
 
 [README（日本語）](../README.md) · [English README](../README_EN.md) · [検証テスト解説書](CONSENSUS_AND_EBPF_PROOF.md) · [クラウド導入ガイド](CLOUD_DEPLOYMENT_GUIDE.md)
 
-本書は、`veil-mesh-consensus` を実験的プロトタイプ（`v0.2.0`）から、現場の Web / API / PHP アプリケーション基盤の水際防衛で確実な運用実績を出せるプロダクション品質（`v1.0.0`）へ引き上げるための技術仕様書です。
+本書は、`veil-mesh-consensus` を実験的プロトタイプ（`v0.3.0`）から、現場の Web / API / PHP アプリケーション基盤の水際防衛で確実な運用実績を出せる実戦パイロット品質（`v0.9.1`）へ引き上げるための技術仕様書です。
 
 抽象的なスローガンや「100%・完全」といった誇張表現を排し、**① 前提条件と保証の境界、② 合意プロトコルの安全性と View-Change 仕様、③ カーネル eBPF (`LPM_TRIE` + 単調増加クロック TTL) のデータ構造、④ 障害復旧（WAL `fsync`）と輻輳制御、⑤ 実運用での SLI/SLO と Runbook** を定義します。
 
@@ -195,12 +195,12 @@ sudo ip link set dev eth0 xdp off
 
 ---
 
-## 7. v1.0 までの実装ロードマップと完了条件（Definition of Done）
+## 7. v0.9.1 までの実装ロードマップと完了条件（Definition of Done）
 
 | 版 | マイルストーン | 実装対象の Clean Architecture モジュール | 完了条件（自動テストによる検証基準） |
 | :---: | :--- | :--- | :--- |
 | **`v0.2.0`**<br>*(完了済)* | **Clean Architecture 4層分離 & CSPRNG 鍵・保護 IP ガード** | `domain/`, `usecase/`, `adapter/`, `infra/`, `proof_tests.rs` | 全 11 証明・回帰テスト (`proof_1`〜`proof_11`)、Markdown Lint、ShellCheck、Clippy が CI でグリーン。 |
-| **`v0.3.0`** | **マルチプロセス `cluster.toml` 運用 & 単調クロック TTL + WAL `fsync`** | `adapter/cluster_config.rs`<br>`adapter/wal_store.rs`<br>`usecase/reconciler.rs`<br>`infra/quic_mtls.rs` (証明書 SHA-256 ピン留め) | ① 別々の4つの OS プロセスが `cluster.toml` を読み込んでピン留め mTLS で合意できること。<br>② `ttl_secs = 2` の遮断ルールが2秒後に自動失効し `ping` が再開すること。<br>③ ノード再起動時に `consensus.wal` から状態を復元し二重投票しないこと。 |
+| **`v0.3.0`**<br>*(完了済)* | **R1〜R10 監査修正：Prefix ハッシュ鎖・Voted-Entry Lock・共有 CA・WAL・XDP ポートバイパス除去** | `domain/entities.rs`, `usecase/consensus_engine.rs`, `adapter/crypto_ring.rs`, `infra/quic_mtls.rs`, `veil-ebpf/` | R1〜R10 回帰テストおよび WAL 復元テストを含む全 20 件（Linux 実機含め 22 件）の自動検証スイートが CI でグリーン。 |
 | **`v0.4.0`** | **2段階 QC (`Prepare`/`Commit`) & 軽量 View-Change (`TC`) + Fuzzing** | `domain/entities.rs` (`TimeoutCertificate`)<br>`usecase/consensus_engine.rs`<br>`fuzz/` (`cargo-fuzz`) | ① リーダープロセスに `SIGSTOP` を送って沈黙させても、残り3台が `TimeoutCertificate` を形成して `term + 1` の新リーダーへ自動交代し、遮断提案が通ること。<br>② `proptest`（10,000 ケース）と `cargo-fuzz` で Panic ゼロ。 |
 | **`v0.5.0`** | **`LPM_TRIE` (IPv4/IPv6 CIDR) & 50ms バッチ + Unix ソケット連携** | `veil-ebpf/src/veil_xdp_kern.c`<br>`infra/sensor_socket.rs`<br>`infra/metrics_prometheus.rs` | ① `/run/veil-mesh/propose.sock` へ 500 件の IPv4/IPv6 CIDR を流し込み、50ms バッチ合意で全ノードの `LPM_TRIE` に反映されること。<br>② [`veil-warden`](https://github.com/mt4110/veil-warden) および Nginx ログ監視からの自動遮断デモが動作すること。 |
-| **`v1.0.0`** | **`veil-arena` カオス試験（遅延・ロス・分断） & 鍵ローテーション** | `scripts/arena-chaos.sh`<br>`docs/OPERATIONS_RUNBOOK.md` | `tc netem` によるパケットロス 20%・遅延 100ms・ネットワーク分断と復旧・リーダー強制停止・偽造パケット注入の複合カオス試験をクリアし、全 SLI メトリクスと `summary.json` 証跡が出力されること。 |
+| **`v0.9.1`** | **`veil-arena` カオス試験（遅延・ロス・分断） & 鍵ローテーション** | `scripts/arena-chaos.sh`<br>`docs/OPERATIONS_RUNBOOK.md` | `tc netem` によるパケットロス 20%・遅延 100ms・ネットワーク分断と復旧・リーダー強制停止・偽造パケット注入の複合カオス試験をクリアし、全 SLI メトリクスと `summary.json` 証跡が出力されること。 |

@@ -5,12 +5,33 @@ use crate::domain::{
     MAX_WIRE_MESSAGE_BYTES,
 };
 use crate::usecase::ports::EbpfBridge;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use veil_common::{
     evaluate_lsm_policy, evaluate_peer_policy, NodeLsmPolicy, PeerPolicy, XdpVerdict,
 };
+
+const WAL_MAGIC_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalPayload {
+    version: u32,
+    node_id: NodeId,
+    current_term: u64,
+    voted_for: Option<NodeId>,
+    log: Vec<LogEntry>,
+    commit_index: u64,
+    commit_qcs: BTreeMap<u64, QuorumCertificate>,
+    voted_entry_hashes: Vec<(u64, u64, [u8; 32])>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalEnvelope {
+    payload_bytes: Vec<u8>,
+    sha256_checksum: [u8; 32],
+}
 
 /// 【UseCase Layer】: 決定論的コンセンサス・ステートマシン（Ed25519 署名付き RPC + 累積ハッシュチェーン + ロック付きマルチシグ QC + ドメイン安全方針ガード + eBPF ブリッジ同期）
 pub struct ConsensusState {
@@ -817,5 +838,120 @@ impl ConsensusState {
 
     pub fn check_lsm_socket_connect(&self) -> i32 {
         evaluate_lsm_policy(Some(&self.lsm_policy))
+    }
+
+    /// 再起動時の二重投票・状態巻き戻りを防ぐ Crash-Recovery WAL スナップショットを `0600` + `sync_all` + SHA-256 検査付きで保存する
+    pub fn save_wal(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use ring::digest;
+        let payload = WalPayload {
+            version: WAL_MAGIC_VERSION,
+            node_id: self.node_id.clone(),
+            current_term: self.current_term,
+            voted_for: self.voted_for.clone(),
+            log: self.log.clone(),
+            commit_index: self.commit_index,
+            commit_qcs: self.commit_qcs.clone(),
+            voted_entry_hashes: self
+                .voted_entry_hashes
+                .iter()
+                .map(|(&(t, i), &h)| (t, i, h))
+                .collect(),
+        };
+        let payload_bytes = bincode::serialize(&payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let digest_val = digest::digest(&digest::SHA256, &payload_bytes);
+        let mut sha256_checksum = [0u8; 32];
+        sha256_checksum.copy_from_slice(digest_val.as_ref());
+
+        let envelope = WalEnvelope {
+            payload_bytes,
+            sha256_checksum,
+        };
+        let bytes = bincode::serialize(&envelope)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("wal.tmp");
+        let _ = std::fs::remove_file(&tmp_path);
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp_path, &bytes)?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// Crash-Recovery WAL から永続化状態を検証・復元し、確定済みエントリを eBPF ブリッジへ再同期する
+    pub fn load_wal(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use ring::digest;
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Refusing symlink WAL file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Insecure WAL permissions {:04o}: expected 0600", mode),
+                ));
+            }
+        }
+
+        let raw = std::fs::read(path)?;
+        let envelope: WalEnvelope = bincode::deserialize(&raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let actual_digest = digest::digest(&digest::SHA256, &envelope.payload_bytes);
+        if actual_digest.as_ref() != envelope.sha256_checksum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL checksum mismatch (corrupted or tampered WAL)",
+            ));
+        }
+
+        let payload: WalPayload = bincode::deserialize(&envelope.payload_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if payload.version != WAL_MAGIC_VERSION || payload.node_id != self.node_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL version or node_id mismatch",
+            ));
+        }
+
+        self.current_term = payload.current_term;
+        self.voted_for = payload.voted_for;
+        self.truncate_log(0);
+        for entry in payload.log {
+            self.push_log_entry(entry);
+        }
+        self.voted_entry_hashes = payload
+            .voted_entry_hashes
+            .into_iter()
+            .map(|(t, i, h)| ((t, i), h))
+            .collect();
+        self.commit_qcs = payload.commit_qcs;
+        self.commit_index = payload.commit_index.min(self.last_log_index());
+        self.last_applied = 0;
+        self.apply_committed_entries();
+        Ok(())
     }
 }

@@ -1309,3 +1309,84 @@ fn regression_r6_r7_linux_xdp_source_port_no_bypass_and_map_capacity() -> Result
     }
     Ok(())
 }
+
+#[test]
+fn regression_wal_crash_recovery_prevents_double_vote_and_restores_ebpf_state() -> Result<()> {
+    let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
+    let wal_dir = std::env::temp_dir().join(format!("veil-mesh-wal-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    std::fs::create_dir_all(&wal_dir)?;
+    let wal_path = wal_dir.join("node-beta.wal");
+
+    let rv = alpha.start_signed_election();
+    for peer in [&mut beta, &mut gamma, &mut delta] {
+        let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
+        alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+    }
+    assert_eq!(alpha.role, Role::Leader);
+
+    let blocked_ip = Ipv4Addr::new(198, 51, 100, 77);
+    alpha
+        .propose(MeshCommand::set_trust(blocked_ip, false))
+        .unwrap();
+    for _round in 0..2 {
+        for (peer_name, peer) in [
+            ("node-beta", &mut beta),
+            ("node-gamma", &mut gamma),
+            ("node-delta", &mut delta),
+        ] {
+            let ae = alpha.sign_rpc(alpha.make_append_entries(peer_name).unwrap());
+            let resp = peer.handle_signed_rpc(ae).unwrap().unwrap();
+            alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
+        }
+    }
+    assert_eq!(beta.commit_index, 1);
+    assert_eq!(beta.check_xdp_packet(blocked_ip), XdpVerdict::Drop);
+
+    // node-beta の状態を WAL に永続化し、再起動した新しい ConsensusState インスタンスへ復元する
+    beta.save_wal(&wal_path)?;
+
+    let bridge_rebooted = Arc::new(MockEbpfBridge::new_with_secret(vec![1, 2, 3, 4]));
+    let mut beta_rebooted = ConsensusState::new(
+        "node-beta",
+        vec![
+            "node-alpha".into(),
+            "node-gamma".into(),
+            "node-delta".into(),
+        ],
+    )
+    .with_ebpf_bridge(bridge_rebooted.clone());
+    beta_rebooted.register_peer_public_keys(beta.peer_public_keys.clone());
+    beta_rebooted.load_wal(&wal_path)?;
+
+    assert_eq!(beta_rebooted.current_term, 1);
+    assert_eq!(beta_rebooted.voted_for, Some("node-alpha".into()));
+    assert_eq!(beta_rebooted.commit_index, 1);
+    assert_eq!(beta_rebooted.last_applied, 1);
+    assert_eq!(beta_rebooted.check_xdp_packet(blocked_ip), XdpVerdict::Drop);
+    assert!(bridge_rebooted
+        .kernel_peer_map
+        .lock()
+        .unwrap()
+        .contains_key(&u32::from(blocked_ip)));
+
+    // 再起動後に同一 Term 1 で別候補 gamma が RequestVote を送っても二重投票しない
+    let rv_gamma = gamma.sign_rpc(ConsensusRpc::RequestVote {
+        term: 1,
+        candidate_id: "node-gamma".into(),
+        last_log_index: 1,
+        last_log_term: 1,
+    });
+    let resp = beta_rebooted.handle_signed_rpc(rv_gamma).unwrap().unwrap();
+    assert_eq!(
+        resp,
+        ConsensusRpc::RequestVoteResponse {
+            term: 1,
+            voter_id: "node-beta".into(),
+            vote_granted: false,
+        }
+    );
+
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    Ok(())
+}
