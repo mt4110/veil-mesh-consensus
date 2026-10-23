@@ -40,11 +40,22 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    /// ログエントリ `(term, index, command)` の決定論的 SHA-256 ダイジェストを計算する
+    /// ログエントリ `(term, index, command)` の決定論的 SHA-256 ダイジェストを計算する（Index 1 / 単体用）
     pub fn digest(&self) -> [u8; 32] {
+        self.digest_with_parent(&[0u8; 32])
+    }
+
+    /// 直前エントリまでの累積チェーンハッシュ `parent_hash` を暗号学的に束縛した SHA-256 ダイジェストを計算する（R1 Prefix 改ざん防止）
+    pub fn digest_with_parent(&self, parent_hash: &[u8; 32]) -> [u8; 32] {
         use ring::digest;
         let bytes = bincode::serialize(self).expect("LogEntry serialization");
-        let hash = digest::digest(&digest::SHA256, &bytes);
+        let mut ctx = digest::Context::new(&digest::SHA256);
+        if *parent_hash != [0u8; 32] {
+            ctx.update(b"VEIL_LOG_CHAIN_V2:");
+            ctx.update(parent_hash);
+        }
+        ctx.update(&bytes);
+        let hash = ctx.finish();
         let mut out = [0u8; 32];
         out.copy_from_slice(hash.as_ref());
         out

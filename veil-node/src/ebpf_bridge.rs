@@ -116,12 +116,17 @@ impl EbpfBridge for AyaKernelBridge {
         let mut bpf = self.bpf.lock().unwrap();
         let mut map: AyaHashMap<_, u32, PeerPolicy> =
             AyaHashMap::try_from(bpf.map_mut(MAP_PEER_POLICY).unwrap())?;
-        map.insert(peer_ip, policy, 0)?;
+        if policy.trusted != 0 {
+            // R6 対策: 遮断解除時はマップからエントリを削除してカーネル eBPF マップ容量を回収する
+            let _ = map.remove(&peer_ip);
+        } else {
+            map.insert(peer_ip, policy, 0)?;
+        }
         info!(
             peer_ip = %std::net::Ipv4Addr::from(peer_ip),
             trusted = policy.trusted,
             epoch = policy.epoch,
-            "Wrote PeerPolicy directly into Linux kernel eBPF map `PEER_POLICY_MAP`"
+            "Synced PeerPolicy directly with Linux kernel eBPF map `PEER_POLICY_MAP`"
         );
         Ok(())
     }

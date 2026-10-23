@@ -3,8 +3,9 @@
  *
  * Safety Features:
  * 1. Always XDP_PASS non-IPv4 traffic (ARP, IPv6, etc.)
- * 2. Always XDP_PASS SSH port 10023 & 22 so remote management is NEVER severed
- * 3. Look up source IPv4 in `PEER_POLICY_MAP` (or destination UDP port == 9999 when policy is Untrusted):
+ * 2. Protected management IPs and loopback are guarded by `SecurityPolicyGuard` prior to map insertion.
+ *    (Removed TCP port 22/10023 L4 bypass so attackers cannot evade XDP_DROP by spoofing source port 22/10023.)
+ * 3. Look up source IPv4 in `PEER_POLICY_MAP`:
  *    - If policy.trusted == 0 -> increment PACKETS_SEEN_MAP[1] (DROP) and return XDP_DROP (1)
  *    - Otherwise -> increment PACKETS_SEEN_MAP[0] (PASS) and return XDP_PASS (2)
  */
@@ -54,7 +55,7 @@ struct bpf_map_def SEC("maps") PEER_POLICY_MAP = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(__u32),
     .value_size = sizeof(struct peer_policy),
-    .max_entries = 256,
+    .max_entries = 4096,
     .map_flags = 0,
 };
 
@@ -103,18 +104,6 @@ int veil_xdp_filter(struct xdp_md *ctx) {
     __u8 ihl = (ip[0] & 0x0F) * 4;
     if (ihl < 20 || data + 14 + ihl > data_end) {
         return XDP_PASS;
-    }
-
-    __u8 proto = ip[9];
-
-    /* SAFETY GUARD: Never drop SSH (TCP port 10023 or 22) on pi-node! */
-    if (proto == 6 && data + 14 + ihl + 4 <= data_end) {
-        const __u8 *tcp = data + 14 + ihl;
-        __u16 sport = read_be16(tcp);
-        __u16 dport = read_be16(tcp + 2);
-        if (sport == 10023 || dport == 10023 || sport == 22 || dport == 22) {
-            return XDP_PASS;
-        }
     }
 
     /* Extract Source IPv4 Address in Host order (matching u32::from(Ipv4Addr)) */

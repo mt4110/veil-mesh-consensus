@@ -19,7 +19,7 @@ pub struct ClusterMtlsPki {
 }
 
 impl ClusterMtlsPki {
-    pub fn generate() -> Result<Self> {
+    fn ca_certificate_params() -> Result<rcgen::CertificateParams> {
         let mut ca_params = rcgen::CertificateParams::new(vec!["veil.mesh.ca".to_string()])?;
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
@@ -27,9 +27,53 @@ impl ClusterMtlsPki {
             rcgen::KeyUsagePurpose::DigitalSignature,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
+        Ok(ca_params)
+    }
+
+    pub fn generate() -> Result<Self> {
+        let ca_params = Self::ca_certificate_params()?;
         let ca_key = rcgen::KeyPair::generate()?;
         let ca_cert = ca_params.self_signed(&ca_key)?;
         let ca_cert_der = ca_cert.der().clone();
+        Ok(Self {
+            ca_cert,
+            ca_key,
+            ca_cert_der,
+        })
+    }
+
+    /// R3 対策: 独立した OS プロセス間で同一の Root CA を共有できるよう、指定ディレクトリから CA 鍵と証明書を読み込む（未作成時は排他生成）
+    pub fn load_or_generate_dir(dir: &std::path::Path) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let key_path = dir.join("ca.key.der");
+        let cert_path = dir.join("ca.cert.der");
+        let ca_params = Self::ca_certificate_params()?;
+
+        if key_path.exists() && cert_path.exists() {
+            let key_der = std::fs::read(&key_path)?;
+            let cert_der = std::fs::read(&cert_path)?;
+            let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
+            let ca_key = rcgen::KeyPair::try_from(&pkcs8)?;
+            let ca_cert = ca_params.self_signed(&ca_key)?;
+            let ca_cert_der = rustls::pki_types::CertificateDer::from(cert_der);
+            return Ok(Self {
+                ca_cert,
+                ca_key,
+                ca_cert_der,
+            });
+        }
+
+        let ca_key = rcgen::KeyPair::generate()?;
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let ca_cert_der = ca_cert.der().clone();
+        let _ = std::fs::write(&key_path, ca_key.serialize_der());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::write(&cert_path, ca_cert_der.as_ref());
+
         Ok(Self {
             ca_cert,
             ca_key,
@@ -90,7 +134,14 @@ impl ClusterMtlsPki {
 
 pub fn default_cluster_pki() -> &'static ClusterMtlsPki {
     static PKI: OnceLock<ClusterMtlsPki> = OnceLock::new();
-    PKI.get_or_init(|| ClusterMtlsPki::generate().expect("Failed to initialize ClusterMtlsPki"))
+    PKI.get_or_init(|| {
+        let shared_dir = std::env::var_os("VEIL_CLUSTER_PKI_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("veil-mesh-cluster-pki-v2"));
+        ClusterMtlsPki::load_or_generate_dir(&shared_dir)
+            .or_else(|_| ClusterMtlsPki::generate())
+            .expect("Failed to initialize ClusterMtlsPki")
+    })
 }
 
 pub fn make_quic_endpoint(bind_addr: SocketAddr) -> Result<quinn::Endpoint> {
@@ -196,6 +247,22 @@ impl MeshNode {
 
         self.replicate_round().await?;
         self.replicate_round().await?;
+
+        // R4 対策: 定足数コミットおよび eBPF 適用が完了していない場合は未コミット成功として扱わずエラーを返す
+        let st = self.state.lock().await;
+        if st.commit_index < index {
+            anyhow::bail!(
+                "Proposal at index {index} failed to reach quorum commit (commit_index={})",
+                st.commit_index
+            );
+        }
+        if st.last_applied < index {
+            anyhow::bail!(
+                "Proposal at index {index} committed but kernel apply failed (last_applied={}, error={:?})",
+                st.last_applied,
+                st.last_apply_error
+            );
+        }
 
         Ok(index)
     }

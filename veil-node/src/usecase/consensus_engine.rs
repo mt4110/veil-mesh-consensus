@@ -1,7 +1,8 @@
 use crate::adapter::NodeCryptoIdentity;
 use crate::domain::{
     qc_vote_payload, ConsensusRpc, LogEntry, MeshCommand, NodeId, QuorumCertificate, Role,
-    SecurityPolicyGuard, SignedConsensusRpc, MAX_SAFE_TERM, MAX_WIRE_MESSAGE_BYTES,
+    SecurityPolicyGuard, SignedConsensusRpc, MAX_LOG_ENTRIES_PER_RPC, MAX_SAFE_TERM,
+    MAX_WIRE_MESSAGE_BYTES,
 };
 use crate::usecase::ports::EbpfBridge;
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,13 +12,15 @@ use veil_common::{
     evaluate_lsm_policy, evaluate_peer_policy, NodeLsmPolicy, PeerPolicy, XdpVerdict,
 };
 
-/// 【UseCase Layer】: 決定論的コンセンサス・ステートマシン（Ed25519 署名付き RPC + マルチシグ QC 必須化 + ドメイン安全方針ガード + eBPF ブリッジ同期）
+/// 【UseCase Layer】: 決定論的コンセンサス・ステートマシン（Ed25519 署名付き RPC + 累積ハッシュチェーン + ロック付きマルチシグ QC + ドメイン安全方針ガード + eBPF ブリッジ同期）
 pub struct ConsensusState {
     pub node_id: NodeId,
     pub peers: Vec<NodeId>,
     pub current_term: u64,
     pub voted_for: Option<NodeId>,
     pub log: Vec<LogEntry>, // 1-indexed 相当（内部 Vec の index 0 が log index 1）
+    /// 各ログ Index の O(1) 累積チェーンハッシュキャッシュ（`log` と完全に同期）
+    pub chain_hashes: Vec<[u8; 32]>,
     pub commit_index: u64,
     pub last_applied: u64,
     pub role: Role,
@@ -34,6 +37,9 @@ pub struct ConsensusState {
     /// コミット確定時に生成された各ログ Index のマルチシグ合意証明書 (`log_index -> QuorumCertificate`)
     pub commit_qcs: BTreeMap<u64, QuorumCertificate>,
 
+    /// 同一 `(term, index)` に対する二重署名（Equivocation / Term Sandwich 攻撃）を防ぐ投票履歴レジストリ
+    pub voted_entry_hashes: BTreeMap<(u64, u64), [u8; 32]>,
+
     /// 確定（Commit & Apply）したコンセンサス結果から同期される eBPF `PEER_POLICY_MAP` のミラー状態
     pub ebpf_policy_map: BTreeMap<u32, PeerPolicy>,
 
@@ -42,6 +48,9 @@ pub struct ConsensusState {
 
     /// カーネル内の実 Aya eBPF マップ（またはテスト用 MockEbpfBridge）へのリアルタイム書き込みポート
     pub ebpf_bridge: Option<Arc<dyn EbpfBridge>>,
+
+    /// 直近のカーネル eBPF 適用エラー（失敗を黙殺せず `Degraded` 状態として追跡する：R4 対策）
+    pub last_apply_error: Option<String>,
 
     /// 自ノードの Ed25519 署名鍵アイデンティティ
     pub identity: Arc<NodeCryptoIdentity>,
@@ -64,6 +73,7 @@ impl std::fmt::Debug for ConsensusState {
             .field("role", &self.role)
             .field("commit_index", &self.commit_index)
             .field("last_applied", &self.last_applied)
+            .field("last_apply_error", &self.last_apply_error)
             .field("ebpf_policy_map", &self.ebpf_policy_map)
             .field("lsm_policy", &self.lsm_policy)
             .field(
@@ -89,6 +99,7 @@ impl ConsensusState {
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
+            chain_hashes: Vec::new(),
             commit_index: 0,
             last_applied: 0,
             role: Role::Follower,
@@ -98,9 +109,11 @@ impl ConsensusState {
             match_index: BTreeMap::new(),
             qc_votes: BTreeMap::new(),
             commit_qcs: BTreeMap::new(),
+            voted_entry_hashes: BTreeMap::new(),
             ebpf_policy_map: BTreeMap::new(),
             lsm_policy: NodeLsmPolicy::new(false, 0),
             ebpf_bridge: None,
+            last_apply_error: None,
             identity,
             peer_public_keys,
             policy_guard: SecurityPolicyGuard::default(),
@@ -197,18 +210,40 @@ impl ConsensusState {
             .unwrap_or(0)
     }
 
-    pub fn start_election(&mut self) -> ConsensusRpc {
-        if self.current_term < MAX_SAFE_TERM - 1 {
-            self.current_term += 1;
+    /// 指定された `index` (1-indexed) までの全プレフィックス `[1..=index]` を暗号学的に束縛した累積チェーンハッシュを O(1) で取得する（R1 対策）
+    pub fn entry_hash_at(&self, index: u64) -> Option<[u8; 32]> {
+        if index == 0 {
+            return None;
         }
-        self.role = Role::Candidate;
-        self.voted_for = Some(self.node_id.clone());
-        self.leader_id = None;
-        self.votes_received.clear();
-        self.votes_received.insert(self.node_id.clone());
+        self.chain_hashes.get((index - 1) as usize).copied()
+    }
 
-        if self.votes_received.len() >= self.quorum_size() {
-            self.become_leader();
+    fn push_log_entry(&mut self, entry: LogEntry) -> [u8; 32] {
+        let parent = self.chain_hashes.last().copied().unwrap_or([0u8; 32]);
+        let h = entry.digest_with_parent(&parent);
+        self.log.push(entry);
+        self.chain_hashes.push(h);
+        h
+    }
+
+    fn truncate_log(&mut self, len: usize) {
+        self.log.truncate(len);
+        self.chain_hashes.truncate(len);
+    }
+
+    pub fn start_election(&mut self) -> ConsensusRpc {
+        // R10 対策: Term 上限到達時に同一 Term 内で voted_for を上書きして二重投票しないよう保護する
+        if self.current_term < MAX_SAFE_TERM {
+            self.current_term += 1;
+            self.role = Role::Candidate;
+            self.voted_for = Some(self.node_id.clone());
+            self.leader_id = None;
+            self.votes_received.clear();
+            self.votes_received.insert(self.node_id.clone());
+
+            if self.votes_received.len() >= self.quorum_size() {
+                self.become_leader();
+            }
         }
 
         ConsensusRpc::RequestVote {
@@ -256,9 +291,9 @@ impl ConsensusState {
             index,
             command,
         };
-        let digest = entry.digest();
+        let digest = self.push_log_entry(entry.clone());
+        self.voted_entry_hashes.insert((entry.term, index), digest);
         let my_qc_sig = self.identity.sign_qc_vote(entry.term, index, &digest);
-        self.log.push(entry.clone());
         self.qc_votes
             .entry(index)
             .or_default()
@@ -276,14 +311,19 @@ impl ConsensusState {
         let prev_log_index = next_idx.saturating_sub(1);
         let prev_log_term = self.term_at(prev_log_index);
 
+        // R9 対策: 1回の RPC で送信するエントリ数を MAX_LOG_ENTRIES_PER_RPC 以下にチャンク分割する
         let entries = if next_idx <= self.last_log_index() {
-            self.log[(next_idx - 1) as usize..].to_vec()
+            let start = (next_idx - 1) as usize;
+            let end = (start + MAX_LOG_ENTRIES_PER_RPC).min(self.log.len());
+            self.log[start..end].to_vec()
         } else {
             Vec::new()
         };
 
-        let commit_qc = if self.commit_index > 0 {
-            self.commit_qcs.get(&self.commit_index).cloned()
+        let batch_last_index = prev_log_index + (entries.len() as u64);
+        let effective_commit = self.commit_index.min(batch_last_index);
+        let commit_qc = if effective_commit > 0 {
+            self.commit_qcs.get(&effective_commit).cloned()
         } else {
             None
         };
@@ -294,9 +334,35 @@ impl ConsensusState {
             prev_log_index,
             prev_log_term,
             entries,
-            leader_commit: self.commit_index,
+            leader_commit: effective_commit,
             commit_qc,
         })
+    }
+
+    /// QC 自体に含まれる Ed25519 マルチシグ定足数と境界値のみを検証する補助関数
+    fn verify_qc_signatures_only(&self, qc: &QuorumCertificate) -> Result<(), &'static str> {
+        if qc.index == 0 || qc.term == 0 || qc.term >= MAX_SAFE_TERM {
+            return Err("Byzantine QC Invalid: index or term out of valid bounds");
+        }
+        let payload = qc_vote_payload(qc.term, qc.index, &qc.entry_hash);
+        let mut valid_signers = BTreeSet::new();
+        for (signer_id, sig_bytes) in &qc.signatures {
+            if let Some(pk_bytes) = self.peer_public_keys.get(signer_id) {
+                if NodeCryptoIdentity::verify_signature(pk_bytes, &payload, sig_bytes) {
+                    valid_signers.insert(signer_id.clone());
+                } else {
+                    return Err("Byzantine QC Forgery Detected: Invalid Ed25519 signature inside QuorumCertificate!");
+                }
+            } else {
+                return Err(
+                    "Byzantine QC Forgery Detected: Unknown signer inside QuorumCertificate!",
+                );
+            }
+        }
+        if valid_signers.len() < self.quorum_size() {
+            return Err("Byzantine Unilateral Commit Rejected: QuorumCertificate lacks required multi-signature quorum!");
+        }
+        Ok(())
     }
 
     pub fn verify_quorum_certificate(
@@ -308,43 +374,25 @@ impl ConsensusState {
             return Err("Byzantine QC Invalid: index or term out of valid bounds");
         }
 
-        match self.log.get((qc.index - 1) as usize) {
-            Some(local_entry) => {
-                if local_entry.term != qc.term || local_entry.digest() != qc.entry_hash {
-                    self.rejected_byzantine_packets += 1;
-                    return Err("Byzantine Equivocation Detected: Leader sent conflicting log entries or mismatched QC hash!");
-                }
-            }
+        let local_chain_hash = match self.entry_hash_at(qc.index) {
+            Some(h) => h,
             None => {
                 self.rejected_byzantine_packets += 1;
                 return Err(
                     "Byzantine QC Invalid: QC refers to a log index not present on follower",
                 );
             }
-        }
+        };
 
-        let payload = qc_vote_payload(qc.term, qc.index, &qc.entry_hash);
-        let mut valid_signers = BTreeSet::new();
-
-        for (signer_id, sig_bytes) in &qc.signatures {
-            if let Some(pk_bytes) = self.peer_public_keys.get(signer_id) {
-                if NodeCryptoIdentity::verify_signature(pk_bytes, &payload, sig_bytes) {
-                    valid_signers.insert(signer_id.clone());
-                } else {
-                    self.rejected_byzantine_packets += 1;
-                    return Err("Byzantine QC Forgery Detected: Invalid Ed25519 signature inside QuorumCertificate!");
-                }
-            } else {
-                self.rejected_byzantine_packets += 1;
-                return Err(
-                    "Byzantine QC Forgery Detected: Unknown signer inside QuorumCertificate!",
-                );
-            }
-        }
-
-        if valid_signers.len() < self.quorum_size() {
+        let local_entry = &self.log[(qc.index - 1) as usize];
+        if local_entry.term != qc.term || local_chain_hash != qc.entry_hash {
             self.rejected_byzantine_packets += 1;
-            return Err("Byzantine Unilateral Commit Rejected: QuorumCertificate lacks required multi-signature quorum!");
+            return Err("Byzantine Equivocation Detected: Leader sent conflicting log entries or mismatched QC chain hash!");
+        }
+
+        if let Err(err) = self.verify_qc_signatures_only(qc) {
+            self.rejected_byzantine_packets += 1;
+            return Err(err);
         }
 
         Ok(())
@@ -457,14 +505,15 @@ impl ConsensusState {
         }
     }
 
-    fn make_append_response(&self, success: bool) -> ConsensusRpc {
+    fn make_append_response(&mut self, success: bool) -> ConsensusRpc {
         let match_index = self.last_log_index();
-        let (entry_term, entry_hash) = self
-            .log
-            .last()
-            .map(|e| (e.term, e.digest()))
-            .unwrap_or((self.current_term, [0u8; 32]));
+        let (entry_term, entry_hash) = match (self.log.last(), self.entry_hash_at(match_index)) {
+            (Some(e), Some(h)) => (e.term, h),
+            _ => (self.current_term, [0u8; 32]),
+        };
         let qc_vote_signature = if success && match_index > 0 {
+            self.voted_entry_hashes
+                .insert((entry_term, match_index), entry_hash);
             self.identity
                 .sign_qc_vote(entry_term, match_index, &entry_hash)
         } else {
@@ -497,11 +546,77 @@ impl ConsensusState {
 
         if self
             .policy_guard
-            .validate_entries(prev_log_index, term, &entries)
+            .validate_entries(prev_log_index, prev_log_term, term, &entries)
             .is_err()
         {
             self.rejected_byzantine_packets += 1;
             return self.make_append_response(false);
+        }
+
+        if prev_log_index > self.last_log_index() || self.term_at(prev_log_index) != prev_log_term {
+            return self.make_append_response(false);
+        }
+
+        // ログ変更前に累積チェーンハッシュ・過去投票ロック（R2）・二重署名制約を事前検証する
+        let mut running_parent = if prev_log_index == 0 {
+            [0u8; 32]
+        } else {
+            match self.entry_hash_at(prev_log_index) {
+                Some(h) => h,
+                None => return self.make_append_response(false),
+            }
+        };
+
+        for entry in &entries {
+            let idx = entry.index;
+            let candidate_hash = entry.digest_with_parent(&running_parent);
+            running_parent = candidate_hash;
+
+            // (A) 同一 (term, index) で過去に別のハッシュに投票済みなら絶対拒否（Equivocation / Term Sandwich 対策）
+            if let Some(&voted_hash) = self.voted_entry_hashes.get(&(entry.term, idx)) {
+                if voted_hash != candidate_hash {
+                    self.rejected_byzantine_packets += 1;
+                    return self.make_append_response(false);
+                }
+            }
+
+            if idx <= self.last_log_index() {
+                let existing = &self.log[(idx - 1) as usize];
+                let existing_hash = self
+                    .entry_hash_at(idx)
+                    .expect("existing index must have chain hash");
+
+                // (B) コミット済みエントリの上書き、または同一 Term 内での別内容への上書きは拒否
+                if (idx <= self.commit_index || existing.term == entry.term)
+                    && existing_hash != candidate_hash
+                {
+                    self.rejected_byzantine_packets += 1;
+                    return self.make_append_response(false);
+                }
+
+                // (C) 既存エントリより古い Term のエントリによる上書きは拒否
+                if entry.term < existing.term {
+                    self.rejected_byzantine_packets += 1;
+                    return self.make_append_response(false);
+                }
+
+                // (D) R2 対策（Voted-Entry Lock）:
+                // 既に自ノードが受理・署名ロックした未コミットエントリを別 Term の競合エントリで上書きするには、
+                // 新しいブランチが 2f+1 の定足数合意を得たことを示す有効な `commit_qc` の添付を必須とする。
+                if entry.term > existing.term && existing_hash != candidate_hash {
+                    let unlocked_by_valid_qc = matches!(
+                        commit_qc,
+                        Some(ref qc)
+                            if qc.term >= entry.term
+                                && qc.index >= idx
+                                && self.verify_qc_signatures_only(qc).is_ok()
+                    );
+                    if !unlocked_by_valid_qc {
+                        self.rejected_byzantine_packets += 1;
+                        return self.make_append_response(false);
+                    }
+                }
+            }
         }
 
         if term > self.current_term || self.role == Role::Candidate {
@@ -509,28 +624,22 @@ impl ConsensusState {
         }
         self.leader_id = Some(leader_id);
 
-        if prev_log_index > self.last_log_index() || self.term_at(prev_log_index) != prev_log_term {
-            return self.make_append_response(false);
-        }
-
         for entry in entries {
             let idx = entry.index;
             if idx <= self.last_log_index() {
-                let existing = &self.log[(idx - 1) as usize];
-                if existing.term == entry.term && existing.digest() != entry.digest() {
-                    self.rejected_byzantine_packets += 1;
-                    return self.make_append_response(false);
-                }
-                if idx <= self.commit_index && existing.digest() != entry.digest() {
-                    self.rejected_byzantine_packets += 1;
-                    return self.make_append_response(false);
-                }
-                if self.term_at(idx) != entry.term {
-                    self.log.truncate((idx - 1) as usize);
-                    self.log.push(entry);
+                let existing_hash = self.entry_hash_at(idx).unwrap();
+                let parent_hash = if idx == 1 {
+                    [0u8; 32]
+                } else {
+                    self.entry_hash_at(idx - 1).unwrap()
+                };
+                let new_hash = entry.digest_with_parent(&parent_hash);
+                if self.term_at(idx) != entry.term || existing_hash != new_hash {
+                    self.truncate_log((idx - 1) as usize);
+                    self.push_log_entry(entry);
                 }
             } else {
-                self.log.push(entry);
+                self.push_log_entry(entry);
             }
         }
 
@@ -587,7 +696,14 @@ impl ConsensusState {
             }
             if match_index > 0 {
                 let leader_entry = &self.log[(match_index - 1) as usize];
-                if leader_entry.digest() != entry_hash {
+                let expected_chain_hash = match self.entry_hash_at(match_index) {
+                    Some(h) => h,
+                    None => {
+                        self.rejected_byzantine_packets += 1;
+                        return;
+                    }
+                };
+                if expected_chain_hash != entry_hash {
                     self.rejected_byzantine_packets += 1;
                     return;
                 }
@@ -628,9 +744,11 @@ impl ConsensusState {
             if self.term_at(n) != self.current_term {
                 continue;
             }
-            let entry = &self.log[(n - 1) as usize];
-            let entry_hash = entry.digest();
-            let entry_term = entry.term;
+            let entry_term = self.log[(n - 1) as usize].term;
+            let entry_hash = match self.entry_hash_at(n) {
+                Some(h) => h,
+                None => continue,
+            };
 
             let sig_map = match self.qc_votes.get(&n) {
                 Some(m) => m.clone(),
@@ -655,15 +773,19 @@ impl ConsensusState {
 
     fn apply_committed_entries(&mut self) {
         while self.last_applied < self.commit_index {
-            self.last_applied += 1;
-            let entry = &self.log[(self.last_applied - 1) as usize];
+            let next_apply = self.last_applied + 1;
+            let entry = &self.log[(next_apply - 1) as usize];
             match &entry.command {
                 MeshCommand::SetPeerTrust { peer_ip, trusted } => {
                     let policy = PeerPolicy::new(*trusted, entry.index as u32);
-                    self.ebpf_policy_map.insert(*peer_ip, policy);
+                    // R4 対策: カーネル eBPF ブリッジへの書き込み結果を先に確認し、失敗時は last_applied を進めずエラーを記録する
                     if let Some(ref bridge) = self.ebpf_bridge {
-                        let _ = bridge.sync_peer_policy(*peer_ip, policy);
+                        if let Err(err) = bridge.sync_peer_policy(*peer_ip, policy) {
+                            self.last_apply_error = Some(err.to_string());
+                            break;
+                        }
                     }
+                    self.ebpf_policy_map.insert(*peer_ip, policy);
                 }
                 MeshCommand::SetNodeLockdown {
                     target_node,
@@ -671,14 +793,19 @@ impl ConsensusState {
                 } => {
                     if target_node == &self.node_id || target_node == "*" {
                         let policy = NodeLsmPolicy::new(*lockdown, entry.index as u32);
-                        self.lsm_policy = policy;
                         if let Some(ref bridge) = self.ebpf_bridge {
-                            let _ = bridge.sync_lsm_policy(policy);
+                            if let Err(err) = bridge.sync_lsm_policy(policy) {
+                                self.last_apply_error = Some(err.to_string());
+                                break;
+                            }
                         }
+                        self.lsm_policy = policy;
                     }
                 }
                 MeshCommand::NoOp => {}
             }
+            self.last_apply_error = None;
+            self.last_applied = next_apply;
         }
     }
 

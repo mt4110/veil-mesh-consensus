@@ -12,9 +12,9 @@ use veil_common::{
     evaluate_lsm_policy, evaluate_peer_policy, NodeLsmPolicy, PeerPolicy, XdpVerdict,
 };
 
-/// IPv4 アドレス (Network Byte Order / Big Endian `u32`) をキーとするピア信頼ポリシーマップ
+/// IPv4 アドレス (Host Byte Order `u32`) をキーとするピア信頼ポリシーマップ
 #[map]
-static PEER_POLICY_MAP: HashMap<u32, PeerPolicy> = HashMap::with_max_entries(256, 0);
+static PEER_POLICY_MAP: HashMap<u32, PeerPolicy> = HashMap::with_max_entries(4096, 0);
 
 /// LSM ステルス GC / 隔離ロックダウン制御マップ (`index 0`: 自ノードの `NodeLsmPolicy`)
 #[map]

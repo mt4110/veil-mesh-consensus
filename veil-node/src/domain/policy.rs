@@ -49,16 +49,18 @@ impl SecurityPolicyGuard {
         Ok(())
     }
 
-    /// `AppendEntries` で受信したエントリ列の境界値（サイズ、連番 Index >= 1、Term 範囲）と方針を検証する
+    /// `AppendEntries` で受信したエントリ列の境界値（サイズ、連番 Index >= 1、単調非減少 Term 範囲）と方針を検証する
     pub fn validate_entries(
         &self,
         prev_log_index: u64,
+        prev_log_term: u64,
         rpc_term: u64,
         entries: &[LogEntry],
     ) -> Result<(), &'static str> {
         if entries.len() > MAX_LOG_ENTRIES_PER_RPC {
             return Err("Entries exceed MAX_LOG_ENTRIES_PER_RPC");
         }
+        let mut min_term = prev_log_term;
         for (offset, entry) in entries.iter().enumerate() {
             let expected_idx = match prev_log_index.checked_add((offset as u64) + 1) {
                 Some(idx) if idx >= 1 => idx,
@@ -66,11 +68,13 @@ impl SecurityPolicyGuard {
             };
             if entry.index != expected_idx
                 || entry.term == 0
+                || entry.term < min_term
                 || entry.term > rpc_term
                 || entry.term >= MAX_SAFE_TERM
             {
                 return Err("Entry index discontinuity or invalid term bounds");
             }
+            min_term = entry.term;
             self.validate_command(&entry.command)?;
         }
         Ok(())

@@ -35,51 +35,86 @@ impl NodeCryptoIdentity {
         }
     }
 
-    /// PKCS#8 バイト列（ファイル保存用）から鍵ペアを復元、または新規生成して `0600` パーミッションで保存する
+    /// PKCS#8 バイト列（ファイル保存用）から鍵ペアを復元、または新規生成して排他的 `0600` パーミッションで保存する（R8 対策）
     pub fn load_or_generate_file(
         node_id: impl Into<String>,
         path: &std::path::Path,
     ) -> std::io::Result<Self> {
         let id = node_id.into();
-        if path.exists() {
-            let bytes = std::fs::read(path)?;
-            if bytes.len() == 32 {
-                let mut seed = [0u8; 32];
-                seed.copy_from_slice(&bytes);
-                return Ok(Self::from_seed(id, &seed));
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Refusing to load Ed25519 key from a symlink",
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode != 0o600 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Insecure key file permissions {:04o} on {}: must be 0600",
+                                mode,
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                let bytes = std::fs::read(path)?;
+                if bytes.len() == 32 {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&bytes);
+                    return Ok(Self::from_seed(id, &seed));
+                }
+                let keypair = Ed25519KeyPair::from_pkcs8(&bytes).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid Ed25519 PKCS#8 key",
+                    )
+                })?;
+                let public_key_bytes = keypair.public_key().as_ref().to_vec();
+                Ok(Self {
+                    node_id: id,
+                    keypair,
+                    public_key_bytes,
+                })
             }
-            let keypair = Ed25519KeyPair::from_pkcs8(&bytes).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid Ed25519 PKCS#8 key",
-                )
-            })?;
-            let public_key_bytes = keypair.public_key().as_ref().to_vec();
-            Ok(Self {
-                node_id: id,
-                keypair,
-                public_key_bytes,
-            })
-        } else {
-            let rng = ring::rand::SystemRandom::new();
-            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-                .map_err(|_| std::io::Error::other("CSPRNG key generation failed"))?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let rng = ring::rand::SystemRandom::new();
+                let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+                    .map_err(|_| std::io::Error::other("CSPRNG key generation failed"))?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(path)?;
+                    file.write_all(pkcs8.as_ref())?;
+                    file.sync_all()?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(path, pkcs8.as_ref())?;
+                }
+                let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("valid PKCS#8");
+                let public_key_bytes = keypair.public_key().as_ref().to_vec();
+                Ok(Self {
+                    node_id: id,
+                    keypair,
+                    public_key_bytes,
+                })
             }
-            std::fs::write(path, pkcs8.as_ref())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
-            let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("valid PKCS#8");
-            let public_key_bytes = keypair.public_key().as_ref().to_vec();
-            Ok(Self {
-                node_id: id,
-                keypair,
-                public_key_bytes,
-            })
+            Err(err) => Err(err),
         }
     }
 

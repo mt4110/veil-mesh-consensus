@@ -421,7 +421,7 @@ fn proof_7_live_linux_kernel_xdp_drop_on_veth() -> Result<()> {
         return Ok(());
     }
 
-    let bridge = match ebpf_bridge::AyaKernelBridge::load_and_attach(
+    let bridge = match crate::ebpf_bridge::AyaKernelBridge::load_and_attach(
         obj_path.to_str().unwrap(),
         "veth-victim",
     ) {
@@ -808,4 +808,504 @@ fn proof_11_boundary_validation_index_zero_and_term_max_no_panic_or_saturation()
             .is_err(),
         "Domain SecurityPolicyGuard must block attempts to XDP_DROP localhost (127.0.0.1)!"
     );
+}
+
+// ==============================================================================
+// R1〜R10 セキュリティ監査（2026-10-23）回帰テストスイート
+// ==============================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn audit_append(
+    leader: &ConsensusState,
+    follower: &mut ConsensusState,
+    term: u64,
+    prev_log_index: u64,
+    prev_log_term: u64,
+    entries: Vec<LogEntry>,
+    leader_commit: u64,
+    commit_qc: Option<QuorumCertificate>,
+) -> ConsensusRpc {
+    follower
+        .handle_signed_rpc(leader.sign_rpc(ConsensusRpc::AppendEntries {
+            term,
+            leader_id: leader.node_id.clone(),
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+            commit_qc,
+        }))
+        .unwrap()
+        .unwrap()
+}
+
+fn audit_sig(resp: ConsensusRpc) -> Vec<u8> {
+    match resp {
+        ConsensusRpc::AppendEntriesResponse {
+            success: true,
+            qc_vote_signature,
+            ..
+        } => qc_vote_signature,
+        other => panic!("expected accepted AppendEntries, got {other:?}"),
+    }
+}
+
+fn audit_qc(
+    a: &ConsensusState,
+    term: u64,
+    index: u64,
+    entry_hash: [u8; 32],
+    others: Vec<(String, Vec<u8>)>,
+) -> QuorumCertificate {
+    let mut signatures: BTreeMap<String, Vec<u8>> = others.into_iter().collect();
+    signatures.insert(
+        a.node_id.clone(),
+        a.identity.sign_qc_vote(term, index, &entry_hash),
+    );
+    QuorumCertificate {
+        term,
+        index,
+        entry_hash,
+        signatures,
+    }
+}
+
+#[test]
+fn regression_r1_tail_qc_rejects_conflicting_prefixes() {
+    let (a, mut b, mut c, _d) = make_four_node_cluster();
+    let ip = Ipv4Addr::new(203, 0, 113, 55);
+    let x = LogEntry {
+        term: 1,
+        index: 1,
+        command: MeshCommand::set_trust(ip, false),
+    };
+    let y = LogEntry {
+        term: 1,
+        index: 1,
+        command: MeshCommand::set_trust(ip, true),
+    };
+    let tail = LogEntry {
+        term: 1,
+        index: 2,
+        command: MeshCommand::NoOp,
+    };
+
+    let bs = audit_sig(audit_append(
+        &a,
+        &mut b,
+        1,
+        0,
+        0,
+        vec![x, tail.clone()],
+        0,
+        None,
+    ));
+    let cs = audit_sig(audit_append(
+        &a,
+        &mut c,
+        1,
+        0,
+        0,
+        vec![y, tail.clone()],
+        0,
+        None,
+    ));
+
+    // R1 検証: B と C の index=2 の累積チェーンハッシュは必ず異なる
+    let b_chain_hash = b.entry_hash_at(2).unwrap();
+    let c_chain_hash = c.entry_hash_at(2).unwrap();
+    assert_ne!(b_chain_hash, c_chain_hash);
+
+    // 悪意あるリーダー A が tail.digest() や b_chain_hash で QC を偽造しても 3/4 定足数が成立せず棄却される
+    for forged_hash in [tail.digest(), b_chain_hash, c_chain_hash] {
+        let qc = audit_qc(
+            &a,
+            1,
+            2,
+            forged_hash,
+            vec![
+                (b.node_id.clone(), bs.clone()),
+                (c.node_id.clone(), cs.clone()),
+            ],
+        );
+        let resp_b = audit_append(&a, &mut b, 1, 2, 1, vec![], 2, Some(qc.clone()));
+        let resp_c = audit_append(&a, &mut c, 1, 2, 1, vec![], 2, Some(qc));
+        assert!(matches!(
+            resp_b,
+            ConsensusRpc::AppendEntriesResponse { success: false, .. }
+        ));
+        assert!(matches!(
+            resp_c,
+            ConsensusRpc::AppendEntriesResponse { success: false, .. }
+        ));
+    }
+
+    assert_eq!((b.commit_index, c.commit_index), (0, 0));
+}
+
+#[test]
+fn regression_r2_hidden_qc_rejects_conflicting_commits_across_terms() {
+    let (a, mut b, mut c, mut d) = make_four_node_cluster();
+    let ip = Ipv4Addr::new(203, 0, 113, 55);
+    let x = LogEntry {
+        term: 1,
+        index: 1,
+        command: MeshCommand::set_trust(ip, false),
+    };
+    let y = LogEntry {
+        term: 2,
+        index: 1,
+        command: MeshCommand::set_trust(ip, true),
+    };
+
+    let bs = audit_sig(audit_append(&a, &mut b, 1, 0, 0, vec![x.clone()], 0, None));
+    let cs = audit_sig(audit_append(&a, &mut c, 1, 0, 0, vec![x.clone()], 0, None));
+    let qx = audit_qc(
+        &a,
+        1,
+        1,
+        x.digest(),
+        vec![(b.node_id.clone(), bs), (c.node_id.clone(), cs)],
+    );
+    // B だけに qx を配送して確定させる
+    audit_sig(audit_append(&a, &mut b, 1, 1, 1, vec![], 1, Some(qx)));
+    assert_eq!(b.commit_index, 1);
+    assert_eq!(b.check_xdp_packet(ip), XdpVerdict::Drop);
+
+    // A が Term 2 で C の未コミット（だが投票ロック済み）の x を QC なしで y に上書きしようとしても C は拒否する
+    let resp_c = audit_append(&a, &mut c, 2, 0, 0, vec![y.clone()], 0, None);
+    assert!(matches!(
+        resp_c,
+        ConsensusRpc::AppendEntriesResponse { success: false, .. }
+    ));
+    assert!(c.rejected_byzantine_packets >= 1);
+
+    // D だけが y に投票しても 2 票（A と D）しか集まらず、3/4 定足数に満たないため C・D ともに y を確定できない
+    let ds = audit_sig(audit_append(&a, &mut d, 2, 0, 0, vec![y.clone()], 0, None));
+    let qy_insufficient = audit_qc(&a, 2, 1, y.digest(), vec![(d.node_id.clone(), ds)]);
+    let resp_d_commit = audit_append(&a, &mut d, 2, 1, 2, vec![], 1, Some(qy_insufficient));
+    assert!(matches!(
+        resp_d_commit,
+        ConsensusRpc::AppendEntriesResponse { success: false, .. }
+    ));
+    assert_eq!(c.commit_index, 0);
+    assert_eq!(d.commit_index, 0);
+}
+
+#[test]
+fn regression_r2_term_sandwich_prevents_double_voting_on_same_slot() {
+    let (a, mut b, _c, _d) = make_four_node_cluster();
+    let x = LogEntry {
+        term: 1,
+        index: 1,
+        command: MeshCommand::NoOp,
+    };
+    let z = LogEntry {
+        term: 2,
+        index: 1,
+        command: MeshCommand::NoOp,
+    };
+    let y = LogEntry {
+        term: 1,
+        index: 1,
+        command: MeshCommand::set_trust(Ipv4Addr::new(203, 0, 113, 55), false),
+    };
+
+    let _sx = audit_sig(audit_append(&a, &mut b, 1, 0, 0, vec![x], 0, None));
+    // Term 2 の QC なし上書き自体が拒否され、さらに Term 1 の別内容 y の混ぜ込みも拒否される
+    let resp_z = audit_append(&a, &mut b, 2, 0, 0, vec![z], 0, None);
+    assert!(matches!(
+        resp_z,
+        ConsensusRpc::AppendEntriesResponse { success: false, .. }
+    ));
+    let resp_y = audit_append(&a, &mut b, 2, 0, 0, vec![y.clone()], 0, None);
+    match resp_y {
+        ConsensusRpc::AppendEntriesResponse {
+            success,
+            qc_vote_signature,
+            ..
+        } => {
+            assert!(!success);
+            assert!(qc_vote_signature.is_empty());
+            assert!(!NodeCryptoIdentity::verify_signature(
+                &b.identity.public_key_bytes,
+                &crate::domain::qc_vote_payload(1, 1, &y.digest()),
+                &qc_vote_signature
+            ));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn regression_r3_multi_process_shared_ca_pki_handshakes_over_mtls() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let temp_dir =
+        std::env::temp_dir().join(format!("veil-mesh-r3-pki-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    // 独立した2つの ClusterMtlsPki インスタンスが同じディレクトリから共通 CA をロードして mTLS 通信できることを検証
+    let pki_proc_1 = ClusterMtlsPki::load_or_generate_dir(&temp_dir)?;
+    let pki_proc_2 = ClusterMtlsPki::load_or_generate_dir(&temp_dir)?;
+
+    let ep_1 = pki_proc_1.make_endpoint("127.0.0.1:0".parse()?)?;
+    let ep_2 = pki_proc_2.make_endpoint("127.0.0.1:0".parse()?)?;
+    let addr_1 = ep_1.local_addr()?;
+
+    let node_1 = MeshNode {
+        node_id: "node-alpha".into(),
+        endpoint: ep_1,
+        state: Arc::new(Mutex::new(ConsensusState::new(
+            "node-alpha",
+            vec!["node-beta".into()],
+        ))),
+        peer_addrs: BTreeMap::new(),
+    };
+    let _srv = node_1.spawn_server();
+
+    crate::infra::send_ping_round(&ep_2, addr_1, "node-beta", 1).await?;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+#[test]
+fn regression_r4_apply_error_is_not_reported_as_applied() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FailingBridge(AtomicUsize);
+    impl crate::usecase::EbpfBridge for FailingBridge {
+        fn sync_peer_policy(&self, _: u32, _: veil_common::PeerPolicy) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("injected map update failure")
+        }
+        fn sync_lsm_policy(&self, _: veil_common::NodeLsmPolicy) -> Result<()> {
+            anyhow::bail!("injected map update failure")
+        }
+        fn stealth_gc_purge_count(&self) -> u64 {
+            0
+        }
+    }
+
+    let bridge = Arc::new(FailingBridge(AtomicUsize::new(0)));
+    let mut node = ConsensusState::new("single-node", vec![]).with_ebpf_bridge(bridge.clone());
+    node.start_election();
+    let ip = Ipv4Addr::new(203, 0, 113, 55);
+    node.propose(MeshCommand::set_trust(ip, false)).unwrap();
+
+    assert_eq!(bridge.0.load(Ordering::SeqCst), 1);
+    assert_eq!(node.commit_index, 1);
+    // R4 修正後: ブリッジ書込み失敗時は last_applied が進まず、誤って Drop 適用済みとして報告しない
+    assert_eq!(node.last_applied, 0);
+    assert!(node.last_apply_error.is_some());
+    assert_eq!(node.check_xdp_packet(ip), XdpVerdict::Pass);
+}
+
+#[tokio::test]
+async fn regression_r4_propose_and_commit_fails_when_peers_unreachable() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (mut alpha, mut beta, mut gamma, _delta) = make_four_node_cluster();
+    let vote = alpha.start_signed_election();
+    for peer in [&mut beta, &mut gamma] {
+        let response = peer.handle_signed_rpc(vote.clone()).unwrap().unwrap();
+        alpha.handle_signed_rpc(peer.sign_rpc(response)).unwrap();
+    }
+    assert_eq!(alpha.role, Role::Leader);
+
+    let unavailable_peer = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let unavailable_addr = unavailable_peer.local_addr()?;
+    let endpoint = make_quic_endpoint("127.0.0.1:0".parse()?)?;
+    let node = MeshNode {
+        node_id: "node-alpha".into(),
+        endpoint,
+        state: Arc::new(Mutex::new(alpha)),
+        peer_addrs: BTreeMap::from([
+            ("node-beta".into(), unavailable_addr),
+            ("node-gamma".into(), unavailable_addr),
+            ("node-delta".into(), unavailable_addr),
+        ]),
+    };
+
+    let res = node
+        .propose_and_commit(MeshCommand::set_trust(Ipv4Addr::new(10, 0, 0, 99), false))
+        .await;
+    assert!(
+        res.is_err(),
+        "propose_and_commit must fail when peers are unreachable and entry is uncommitted"
+    );
+    let state = node.state.lock().await;
+    assert_eq!(state.commit_index, 0);
+    assert_eq!(state.last_applied, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_r8_insecure_key_file_permissions_are_rejected() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let unique_dir =
+        std::env::temp_dir().join(format!("veil-mesh-r8-key-perm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&unique_dir);
+    std::fs::create_dir_all(&unique_dir)?;
+    let key_path = unique_dir.join("review-generated-identity.pk8");
+
+    let _original = NodeCryptoIdentity::load_or_generate_file("permission-check", &key_path)?;
+    let created_mode = std::fs::metadata(&key_path)?.permissions().mode() & 0o777;
+    assert_eq!(created_mode, 0o600);
+
+    // 0644 に緩められた鍵ファイルは読み込み時に PermissionDenied で拒否される
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))?;
+    let err = NodeCryptoIdentity::load_or_generate_file("permission-check", &key_path)
+        .err()
+        .expect("0644 key file must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let _ = std::fs::remove_dir_all(&unique_dir);
+    Ok(())
+}
+
+#[test]
+fn regression_r9_catch_up_batch_is_chunked_within_receiver_limit() {
+    let (mut a, mut b, _c, _d) = make_four_node_cluster();
+    a.role = Role::Leader;
+    a.current_term = 1;
+    for _ in 0..=crate::domain::MAX_LOG_ENTRIES_PER_RPC {
+        a.propose(MeshCommand::NoOp).unwrap();
+    }
+
+    // 1回目の送信で MAX_LOG_ENTRIES_PER_RPC (1024件) がチャンク送信され、フォロワー B に受理される
+    let msg1 = a.sign_rpc(a.make_append_entries(&b.node_id).unwrap());
+    let resp1 = b.handle_signed_rpc(msg1).unwrap().unwrap();
+    assert!(matches!(
+        resp1,
+        ConsensusRpc::AppendEntriesResponse {
+            success: true,
+            match_index: 1024,
+            ..
+        }
+    ));
+    a.handle_signed_rpc(b.sign_rpc(resp1)).unwrap();
+
+    // 2回目の送信で残りの1件 (index=1025) が送信され、1025件すべて追随完了する
+    let msg2 = a.sign_rpc(a.make_append_entries(&b.node_id).unwrap());
+    let resp2 = b.handle_signed_rpc(msg2).unwrap().unwrap();
+    assert!(matches!(
+        resp2,
+        ConsensusRpc::AppendEntriesResponse {
+            success: true,
+            match_index: 1025,
+            ..
+        }
+    ));
+    assert_eq!(b.log.len(), 1025);
+}
+
+#[test]
+fn regression_r10_last_accepted_term_never_revotes_in_same_term() {
+    let (a, mut b, _c, _d) = make_four_node_cluster();
+    b.handle_signed_rpc(a.sign_rpc(ConsensusRpc::RequestVote {
+        term: crate::domain::MAX_SAFE_TERM - 1,
+        candidate_id: a.node_id.clone(),
+        last_log_index: 0,
+        last_log_term: 0,
+    }))
+    .unwrap();
+    assert_eq!(b.voted_for, Some(a.node_id.clone()));
+
+    let previous = b.current_term;
+    b.start_election();
+    // MAX_SAFE_TERM - 1 からの選挙では Term が MAX_SAFE_TERM へ単調増加する
+    assert_eq!(b.current_term, previous + 1);
+    assert_eq!(b.voted_for, Some(b.node_id.clone()));
+
+    // さらに MAX_SAFE_TERM 上限に張り付いた状態では、それ以上 Term を増やせないため voted_for を上書きしない
+    b.voted_for = Some(a.node_id.clone());
+    b.start_election();
+    assert_eq!(b.current_term, crate::domain::MAX_SAFE_TERM);
+    assert_eq!(b.voted_for, Some(a.node_id));
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn regression_r6_r7_linux_xdp_source_port_no_bypass_and_map_capacity() -> Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    #[repr(C)]
+    #[derive(Default)]
+    struct TestRun {
+        prog_fd: u32,
+        retval: u32,
+        data_size_in: u32,
+        data_size_out: u32,
+        data_in: u64,
+        data_out: u64,
+        repeat: u32,
+        duration: u32,
+        ctx_size_in: u32,
+        ctx_size_out: u32,
+        ctx_in: u64,
+        ctx_out: u64,
+        flags: u32,
+        cpu: u32,
+        batch_size: u32,
+        padding: u32,
+    }
+    unsafe extern "C" {
+        fn syscall(number: std::os::raw::c_long, ...) -> std::os::raw::c_long;
+    }
+    fn verdict(fd: i32, source_port: u16) -> Result<u32> {
+        let mut packet = [0u8; 64];
+        packet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        packet[14] = 0x45;
+        packet[16..18].copy_from_slice(&40u16.to_be_bytes());
+        packet[22] = 64;
+        packet[23] = 6;
+        packet[26..30].copy_from_slice(&[203, 0, 113, 55]);
+        packet[30..34].copy_from_slice(&[198, 51, 100, 10]);
+        packet[34..36].copy_from_slice(&source_port.to_be_bytes());
+        packet[36..38].copy_from_slice(&443u16.to_be_bytes());
+        packet[46] = 0x50;
+        packet[47] = 0x02;
+        let mut output = [0u8; 128];
+        let mut attr = TestRun {
+            prog_fd: fd as u32,
+            data_size_in: packet.len() as u32,
+            data_size_out: output.len() as u32,
+            data_in: packet.as_ptr() as u64,
+            data_out: output.as_mut_ptr() as u64,
+            repeat: 1,
+            ..Default::default()
+        };
+        let result = unsafe { syscall(321, 10u32, &mut attr, std::mem::size_of::<TestRun>()) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(attr.retval)
+    }
+    let object = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("assets/veil_xdp_kern.o");
+    let mut bpf = match aya::Ebpf::load_file(object) {
+        Ok(b) => b,
+        Err(_) => return Ok(()),
+    };
+    let program: &mut aya::programs::Xdp =
+        bpf.program_mut("veil_xdp_filter").unwrap().try_into()?;
+    if program.load().is_err() {
+        return Ok(());
+    }
+    let fd = program.fd()?.as_fd().as_raw_fd();
+    let blocked_ip = u32::from(Ipv4Addr::new(203, 0, 113, 55));
+    let mut map: aya::maps::HashMap<_, u32, veil_common::PeerPolicy> =
+        aya::maps::HashMap::try_from(bpf.map_mut("PEER_POLICY_MAP").unwrap())?;
+    map.insert(blocked_ip, veil_common::PeerPolicy::new(false, 1), 0)?;
+
+    // R7 修正後: 送信元ポートが 40000 でも 22 でも 10023 でもすべて XDP_DROP (1) となる
+    assert_eq!(verdict(fd, 40000)?, 1);
+    assert_eq!(verdict(fd, 22)?, 1);
+    assert_eq!(verdict(fd, 10023)?, 1);
+
+    // R6 修正後: 257件以上のエントリ挿入も成功する（容量 4096）
+    for i in 0..300u32 {
+        map.insert(0xc0000200u32 + i, veil_common::PeerPolicy::new(false, 1), 0)?;
+    }
+    Ok(())
 }
