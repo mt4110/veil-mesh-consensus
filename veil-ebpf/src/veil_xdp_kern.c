@@ -20,6 +20,7 @@ typedef unsigned long long __u64;
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_FUNC_map_lookup_elem 1
+#define BPF_FUNC_trace_printk 6
 
 #define XDP_ABORTED 0
 #define XDP_DROP 1
@@ -66,6 +67,7 @@ struct bpf_map_def SEC("maps") PACKETS_SEEN_MAP = {
 };
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)BPF_FUNC_map_lookup_elem;
+static long (*bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) = (void *)BPF_FUNC_trace_printk;
 
 static __always_inline __u16 read_be16(const __u8 *p) {
     return ((__u16)p[0] << 8) | (__u16)p[1];
@@ -121,6 +123,8 @@ int veil_xdp_filter(struct xdp_md *ctx) {
     struct peer_policy *policy = bpf_map_lookup_elem(&PEER_POLICY_MAP, &src_ip);
     if (policy && policy->trusted == 0) {
         record_packet(1); /* index 1 = XDP_DROP count */
+        const char fmt[] = "VEIL_XDP_DROP: blocked packet from src_ip=0x%x (epoch=%u)\n";
+        bpf_trace_printk(fmt, sizeof(fmt), src_ip, policy->epoch);
         return XDP_DROP;
     }
 

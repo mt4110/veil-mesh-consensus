@@ -92,13 +92,16 @@
       mkDevShell = pkgs: pkgs.mkShell {
         packages = with pkgs; [
           (rust-bin.nightly.latest.default.override {
-            extensions = [ "rust-src" "rust-analyzer" "clippy" ];
+            extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
           })
           bpf-linker
           llvmPackages_17.clang
           llvmPackages_17.libllvm
           pkg-config
           openssl
+          markdownlint-cli2
+          pre-commit
+          shellcheck
         ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           bpftool
           aya-tool

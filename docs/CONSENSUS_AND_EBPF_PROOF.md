@@ -1,6 +1,6 @@
 # `veil-mesh-consensus` 低レイヤー・コンセンサス & eBPF/LSM 連動 証明解説書
 
-本書は、`veil-mesh-consensus` において **QUIC (`Tokio` + `quinn`) トランスポート上の合意形成アルゴリズム（Raft + Ed25519 BFT 署名検証）** と **Linux カーネル空間の eBPF (`Aya` XDP パケットフィルタ & LSM `lsm=bpf` ステルス GC)** が一貫して動作し、スプリットブレインやビザンチン攻撃（なりすまし・改ざん）に対して安全であることを証明する技術解説ドキュメントです。
+本書は、`veil-mesh-consensus` において **QUIC (`Tokio` + `quinn`) トランスポート上の合意形成アルゴリズム（Raft + Ed25519 BFT 署名検証 + SHA-256 ダイジェスト & マルチシグ `QuorumCertificate`）** と **Linux カーネル空間の eBPF (`Aya` XDP パケットフィルタ & LSM `lsm=bpf` ステルス GC)** が一貫して動作し、スプリットブレインやビザンチン攻撃（なりすまし・改ざん・リーダー裏切り）に対して安全であることを証明する技術解説ドキュメントです。
 
 ---
 
@@ -19,10 +19,10 @@ sequenceDiagram
     Note over Alpha,Beta: 1. Ed25519 署名付きコンセンサス提案 & レプリケーション
     Alpha->>Alpha: propose(SetPeerTrust / SetNodeLockdown)
     Alpha->>Beta: QUIC Bi-Stream: SignedConsensusRpc(AppendEntries)
-    Beta->>Beta: Ed25519 公開鍵検証 & Log Matching 検証
+    Beta->>Beta: Ed25519 公開鍵検証 & SHA-256 ダイジェスト検証
     Beta-->>Alpha: AppendEntriesResponse (success=true, match_index)
 
-    Note over Alpha,Kernel: 2. 過半数 (Quorum) 達成による Commit & Apply
+    Note over Alpha,Kernel: 2. 過半数 (Quorum) 達成 & マルチシグ QuorumCertificate による Commit
     Alpha->>Alpha: advance_commit_index() -> apply_committed_entries()
     Alpha->>Beta: AppendEntries (leader_commit 更新通知)
     Beta->>Beta: apply_committed_entries()
@@ -51,12 +51,13 @@ eBPF プログラムとユーザー空間テストの間で仕様の乖離が起
 
 ---
 
-## 3. 5つの数学的・実装的証明テスト（`cargo test`）の解説
+## 3. 8つの数学的・実装的証明テスト（`cargo test`）の解説
 
-[`veil-node/src/main.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs#L363-L699) に実装された 5 つのテストケースは、分散システムおよびカーネルセキュリティにおける重要な不変条件（Invariants）を証明しています。
+[`veil-node/src/main.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs) に実装された 8 つのテストケースは、分散システムおよびカーネルセキュリティにおける重要な不変条件（Invariants）を証明しています。
 
 ### 証明 1: Election Safety（単一リーダー選出の安全性）
-- **テスト関数**: [`proof_1_election_safety_and_log_up_to_date_check`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs#L369-L410)
+
+- **テスト関数**: `proof_1_election_safety_and_log_up_to_date_check`
 - **証明する命題**: 同一の `Term`（任期）において、クラスタ内で同時に2台以上のリーダーが誕生することは絶対にない。
 - **メカニズム**:
   1. `node-alpha` と `node-gamma` が同時に `Term 1` で立候補（`start_election()`）。
@@ -67,7 +68,8 @@ eBPF プログラムとユーザー空間テストの間で仕様の乖離が起
 ---
 
 ### 証明 2: 実 QUIC メッシュ（3ノード）での合意形成と eBPF XDP 即時遮断
-- **テスト関数**: [`proof_2_three_node_quic_consensus_and_ebpf_xdp_enforcement`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs#L413-L512)
+
+- **テスト関数**: `proof_2_three_node_quic_consensus_and_ebpf_xdp_enforcement`
 - **証明する命題**: 実際の UDP ソケット上の QUIC (TLS 1.3) 双方向ストリーム通信を介して、3ノード間でリーダー選出とログ複製が行われ、全ノードの XDP フィルタ状態が一斉に切り替わる。
 - **メカニズム**:
   1. `node-alpha`, `node-beta`, `node-gamma` の3つの QUIC エンドポイントを起動。
@@ -78,7 +80,8 @@ eBPF プログラムとユーザー空間テストの間で仕様の乖離が起
 ---
 
 ### 証明 3: ネットワーク分断（Split-Brain）耐性と再合流時のロールバック収束
-- **テスト関数**: [`proof_3_network_partition_split_brain_prevention_and_recovery`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs#L515-L584)
+
+- **テスト関数**: `proof_3_network_partition_split_brain_prevention_and_recovery`
 - **証明する命題**: ネットワーク分断によって孤立した少数派の旧リーダーは eBPF ポリシーを変更できず（Split-Brain の完全防止）、分断復旧時には未コミットログが破棄されて多数派のポリシーへ完全収束する。
 - **メカニズム**:
   1. `Term 1` のリーダー `node-alpha` が `[alpha]` (1台) と `[beta, gamma]` (2台) に分断される。
@@ -89,18 +92,20 @@ eBPF プログラムとユーザー空間テストの間で仕様の乖離が起
 ---
 
 ### 証明 4: カーネル eBPF ブリッジ連動と LSM ステルス GC (`lsm=bpf`) による機密メモリゼロ消去
-- **テスト関数**: [`proof_4_ebpf_kernel_bridge_and_lsm_stealth_gc_zeroization`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs#L590-L654)
+
+- **テスト関数**: `proof_4_ebpf_kernel_bridge_and_lsm_stealth_gc_zeroization`
 - **証明する命題**: コンセンサスで特定ノードの隔離 (`SetNodeLockdown`) が合意されると、[`EbpfBridge`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/ebpf_bridge.rs#L8-L18) を通じてカーネルの `LSM_POLICY_MAP` が書き換えられ、LSM フックが `-EPERM (-1)` で通信を封鎖すると同時に、メモリ上の機密鍵がゼロ消去（Stealth GC）される。
 - **メカニズム**:
   1. Linux 実機用の [`AyaKernelBridge`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/ebpf_bridge.rs#L71-L153) と同じインターフェースを持つ [`MockEbpfBridge`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/ebpf_bridge.rs#L22-L68) に機密鍵データ (`[0xCA, 0xFE, 0xBA, 0xBE]`) を保持させる。
-  2. `SetNodeLockdown { target_node: "node-beta", lockdown: true }` が合意・コミットされた瞬間、[`apply_committed_entries`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/consensus.rs#L483-L509) から `bridge.sync_lsm_policy()` が呼び出される。
+  2. `SetNodeLockdown { target_node: "node-beta", lockdown: true }` が合意・コミットされた瞬間、`apply_committed_entries` から `bridge.sync_lsm_policy()` が呼び出される。
   3. `node-beta` の LSM `socket_connect` 判定が `-1` (`-EPERM`) に切り替わり、同時に `sensitive_key_material` の全バイトが `0` で上書き・消去され、`stealth_gc_purge_count()` が `1` になることを確認。
 
 ---
 
 ### 証明 5: ビザンチン障害耐性（Ed25519 暗号署名によるなりすまし・偽造・改ざんの完全阻止）
-- **テスト関数**: [`proof_5_byzantine_fault_tolerance_ed25519_signature_verification`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs#L661-L742)
-- **証明する命題**: クラスタ内部のノードが侵害されたり、悪意ある第三者がネットワークに介入して「嘘の投票」「リーダーへのなりすまし」「合意コマンドの改ざん」を行っても、[`handle_signed_rpc`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/consensus.rs#L214-L240) の Ed25519 署名検証によって 100% 検知・破棄される。
+
+- **テスト関数**: `proof_5_byzantine_fault_tolerance_ed25519_signature_verification`
+- **証明する命題**: クラスタ内部のノードが侵害されたり、悪意ある第三者がネットワークに介入して「嘘の投票」「リーダーへのなりすまし」「合意コマンドの改ざん」を行っても、`handle_signed_rpc` の Ed25519 署名検証によって 100% 検知・破棄される。
 - **検証している3つのビザンチン攻撃シナリオ**:
   - **攻撃 A（Identity Spoofing / なりすまし）**: 侵害された `node-gamma` が自身の秘密鍵で署名しつつ、RPC ペイロード内の `leader_id` を `"node-alpha"` と詐称して送信 $\to$ エンベロープの `signer_id` とペイロードの `sender_id()` の不一致により即座に拒否。
   - **攻撃 B（Signature Forgery / 秘密鍵偽造）**: 攻撃者 `node-mallory` が `signer_id = "node-alpha"` と名乗り、自身の秘密鍵で署名した RPC を送信 $\to$ 登録済みの `node-alpha` の Ed25519 公開鍵による検証 (`UnparsedPublicKey::verify`) が失敗し拒否。
@@ -109,9 +114,30 @@ eBPF プログラムとユーザー空間テストの間で仕様の乖離が起
 
 ---
 
+### 証明 6: 実 OS 攻撃プロセスの生成とコンセンサス + eBPF + `SIGKILL` による完全駆逐
+
+- **テスト関数**: `proof_6_tui_arena_mock_attack_process_spawn_and_extermination`
+- **証明する命題**: 実際に OS 上で稼働する不審プロセス（PID）に対し、コンセンサス合意をトリガーとして XDP 遮断・LSM ロックダウン・Stealth GC・`SIGKILL` 強制終了がアトミックに遂行される。
+
+---
+
+### 証明 7: 実機 Linux カーネル (`veth-victim`) 上での `XDP_DROP` ライブ遮断証明
+
+- **テスト関数**: `proof_7_live_linux_kernel_xdp_drop_on_veth`
+- **証明する命題**: Linux カーネルの仮想 NIC ペア (`veth-victim` $\leftrightarrow$ `ns-veil-rogue`) に実際の eBPF プログラム (`veil_xdp_kern.o`) をアタッチし、コンセンサスで `trusted=false` が合意された瞬間に `ping` パケットがカーネル NIC 層で 100% `XDP_DROP` され、`trusted=true` の再合意で即座に通信再開する。
+
+---
+
+### 証明 8: リーダー裏切り（二枚舌 Equivocation & 単独コミット捏造）の完全阻止
+
+- **テスト関数**: `proof_8_leader_equivocation_and_multisig_quorum_certificate_defense`
+- **証明する命題**: 万が一リーダー自身が乗っ取られ、フォロワーごとに異なるログを送る「二枚舌攻撃（Equivocation）」や、フォロワーの同意なしに単独でコミットを発行する攻撃を行っても、SHA-256 エントリダイジェスト検証と $2f+1$ マルチシグ `QuorumCertificate` によって 100% 検知・拒絶される。
+
+---
+
 ## 4. 検証コマンドの実行方法
 
-ワークスペースのルートで以下のコマンドを実行することで、上記 5 つの証明テストをいつでも再実行・検証できます。
+ワークスペースのルートで以下のコマンドを実行することで、上記 8 つの証明テストをいつでも再実行・検証できます。
 
 ```bash
 cargo test --workspace -- --nocapture

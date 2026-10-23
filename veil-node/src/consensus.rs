@@ -14,15 +14,9 @@ pub type NodeId = String;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MeshCommand {
     /// ピアの信頼状態（`XDP_PASS` / `XDP_DROP`）を合意によって更新する
-    SetPeerTrust {
-        peer_ip: u32,
-        trusted: bool,
-    },
+    SetPeerTrust { peer_ip: u32, trusted: bool },
     /// 特定ノード（または全ノード）の LSM ステルス GC ロックダウンを発動・解除する
-    SetNodeLockdown {
-        target_node: NodeId,
-        lockdown: bool,
-    },
+    SetNodeLockdown { target_node: NodeId, lockdown: bool },
     /// リーダーによる定期的な生存確認とコミット進行用の NoOp
     NoOp,
 }
@@ -231,7 +225,10 @@ impl std::fmt::Debug for ConsensusState {
             .field("last_applied", &self.last_applied)
             .field("ebpf_policy_map", &self.ebpf_policy_map)
             .field("lsm_policy", &self.lsm_policy)
-            .field("rejected_byzantine_packets", &self.rejected_byzantine_packets)
+            .field(
+                "rejected_byzantine_packets",
+                &self.rejected_byzantine_packets,
+            )
             .finish()
     }
 }
@@ -273,7 +270,10 @@ impl ConsensusState {
     /// ビザンチン耐性検証付き RPC ハンドラ：
     /// 1. `signer_id` と RPC 内部の主張送信者 (`sender_id()`) が一致することを確認（なりすまし防止）
     /// 2. `peer_public_keys` に登録された公開鍵で Ed25519 署名を検証（改ざん・偽造防止）
-    pub fn handle_signed_rpc(&mut self, signed: SignedConsensusRpc) -> Result<Option<ConsensusRpc>, &'static str> {
+    pub fn handle_signed_rpc(
+        &mut self,
+        signed: SignedConsensusRpc,
+    ) -> Result<Option<ConsensusRpc>, &'static str> {
         // 1. エンベロープの署名者 ID と RPC ペイロード内の送信者 ID の一致チェック
         if signed.signer_id != signed.rpc.sender_id() {
             self.rejected_byzantine_packets += 1;
@@ -285,7 +285,9 @@ impl ConsensusState {
             Some(pk) => pk,
             None => {
                 self.rejected_byzantine_packets += 1;
-                return Err("Byzantine Fault Detected: unknown signer_id not in trusted mesh registry");
+                return Err(
+                    "Byzantine Fault Detected: unknown signer_id not in trusted mesh registry",
+                );
             }
         };
 
@@ -294,7 +296,9 @@ impl ConsensusState {
         let peer_pub_key = UnparsedPublicKey::new(&signature::ED25519, pub_key_bytes);
         if peer_pub_key.verify(&payload, &signed.signature).is_err() {
             self.rejected_byzantine_packets += 1;
-            return Err("Byzantine Fault Detected: invalid Ed25519 signature or tampered RPC payload");
+            return Err(
+                "Byzantine Fault Detected: invalid Ed25519 signature or tampered RPC payload",
+            );
         }
 
         Ok(self.handle_rpc(signed.rpc))
@@ -415,7 +419,10 @@ impl ConsensusState {
     /// 1. リーダーが同じ `(term, index)` で異なる `entry_hash` を送ってきた場合（二枚舌攻撃）、即座に検知して拒否する
     /// 2. `QuorumCertificate` に含まれる異なるノードからの Ed25519 署名が過半数（または $2f+1$）以上あり、
     ///    すべて同一の `(term, index, entry_hash)` に対する有効な署名であることを検証する
-    pub fn verify_quorum_certificate(&mut self, qc: &QuorumCertificate) -> Result<(), &'static str> {
+    pub fn verify_quorum_certificate(
+        &mut self,
+        qc: &QuorumCertificate,
+    ) -> Result<(), &'static str> {
         // 1. 自身のログに該当 index が存在し、ハッシュが一致するか確認（二枚舌 Equivocation の検知）
         if let Some(local_entry) = self.log.get((qc.index.saturating_sub(1)) as usize) {
             if local_entry.term == qc.term && local_entry.digest() != qc.entry_hash {
@@ -439,7 +446,9 @@ impl ConsensusState {
                 }
             } else {
                 self.rejected_byzantine_packets += 1;
-                return Err("Byzantine QC Forgery Detected: Unknown signer inside QuorumCertificate!");
+                return Err(
+                    "Byzantine QC Forgery Detected: Unknown signer inside QuorumCertificate!",
+                );
             }
         }
 
@@ -551,6 +560,7 @@ impl ConsensusState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_append_entries(
         &mut self,
         term: u64,
@@ -675,12 +685,7 @@ impl ConsensusState {
             if self.term_at(n) != self.current_term {
                 continue;
             }
-            let replicated_count = 1
-                + self
-                    .match_index
-                    .values()
-                    .filter(|&&m| m >= n)
-                    .count();
+            let replicated_count = 1 + self.match_index.values().filter(|&&m| m >= n).count();
 
             if replicated_count >= self.quorum_size() {
                 self.commit_index = n;

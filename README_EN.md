@@ -1,8 +1,12 @@
 # 🛡️ veil-mesh-consensus
 
-Japanese version (Main) is available at [README.md](README.md).
+[![CI Checks](https://github.com/mt4110/veil-mesh-consensus/actions/workflows/ci.yml/badge.svg)](https://github.com/mt4110/veil-mesh-consensus/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/mt4110/veil-mesh-consensus)](https://github.com/mt4110/veil-mesh-consensus/releases)
 
-**An autonomous mesh defense and attack extermination foundation that directly bridges Byzantine-resilient consensus (Raft + Ed25519 signature verification) over QUIC (`Tokio` + `quinn`) with Linux kernel eBPF (`Aya` XDP packet filtering & LSM `lsm=bpf` Stealth GC).**
+[日本語 (Main)](README.md) · [☁️ Cloud Deployment Guide (AWS/GCP/Azure/CF/Vercel)](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 Proof Documentation](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
+
+**An autonomous mesh defense and attack extermination foundation that directly bridges Byzantine-resilient consensus (Raft + Ed25519 signature verification + SHA-256 Digest & Multi-Sig `QuorumCertificate`) over QUIC (`Tokio` + `quinn`) with Linux kernel eBPF (`Aya` XDP packet filtering & LSM `lsm=bpf` Stealth GC).**
 
 ![Autonomous Attack Extermination Flow](./assets/extermination-flow.svg)
 
@@ -15,8 +19,10 @@ Japanese version (Main) is available at [README.md](README.md).
 <!-- rgc:end -->
 
 > **🎥 What You Are Seeing in the Demo GIF (`[a]` $\to$ `[b]` $\to$ `[x]` Key Sequence)**
+>
 > - **Left Terminal (`sudo iftop -i veth-victim`)**: Real-time network bandwidth monitor on a physical Linux host (`pi-node`: Kernel 7.0 x86_64).
 > - **Right Terminal (`veil-node --tui`)**: TUI Arena with live eBPF bytecode (`veil_xdp_kern.o`) attached directly to the kernel `veth-victim` interface.
+>
 > 1. **Press `[a]` (Spawn Rogue Attack Process)**: Spawns a real OS process inside `ns-veil-rogue` (`10.99.0.66`) firing a 1,000 pkt/s UDP flood at `10.99.0.1:9999`. The bandwidth bar in `iftop` spikes immediately.
 > 2. **Press `[b]` (Inject Byzantine Forged RPC)**: Broadcasts a forged `AppendEntries` RPC spoofing `node-alpha` (`Term 999`). All 3 nodes cryptographically verify and reject the packet via **Ed25519 public key verification** (purple audit log).
 > 3. **Press `[x]` (Consensus Exterminate)**: Once Quorum (3/3) commits the block policy, `sys_bpf(BPF_MAP_UPDATE_ELEM)` writes `trusted=0` into the kernel `PEER_POLICY_MAP`, simultaneously triggering **NIC-level `XDP_DROP`**, **Stealth GC memory zeroization (`ZEROIZED`)**, and **`sys_kill(PID, SIGKILL=9)`** to terminate the rogue OS process.
@@ -59,10 +65,12 @@ flowchart LR
 
 ## 🛡️ Byzantine Generals Problem: Breach Probability & Security Analysis
 
-**Q. "What happens if a Byzantine General (a malicious or compromised node) appears? Can the cluster be breached, and what is the probability?"**
+### Q. "What happens if a Byzantine General (a malicious or compromised node) appears? Can the cluster be breached, and what is the probability?"
 
 ### 1. External Spoofing or Packet Tampering: Breach Probability $\le 2^{-128}$ (~0%)
+
 Every consensus RPC (`RequestVote`, `AppendEntries`) is signed and verified using **Ed25519 (128-bit security level)**.
+
 - The probability of an external attacker forging a valid signature without the private key is:
   $$P(\text{Signature Forgery}) \approx \frac{1}{2^{128}} \approx 2.9 \times 10^{-39}$$
 - Modifying even a single bit of a legitimate leader's payload (e.g., flipping `trusted: false` to `trusted: true`) causes Ed25519 verification to fail 100% of the time (`proof_5`).
@@ -78,15 +86,29 @@ Every consensus RPC (`RequestVote`, `AppendEntries`) is signed and verified usin
 
 ---
 
-## 🧪 7 Mathematical & Live-Kernel Proof Tests
+## 🧪 8 Mathematical & Live-Kernel Proof Tests
 
 ```bash
 # Run unit & QUIC proof tests locally
 cargo test --workspace -- --nocapture
 
-# Run all 7 proof tests including live Linux kernel XDP_DROP on pi-node
+# Run all 8 proof tests including live Linux kernel XDP_DROP on pi-node
 bash scripts/deploy-pi-node.sh test
 
 # Save verification evidence in veil-arena format
 bash scripts/arena-smoke.sh
 ```
+
+---
+
+## ☁️ Cloud & Edge Deployment Matrix (AWS / GCP / Azure / Cloudflare / Vercel)
+
+See **[docs/CLOUD_DEPLOYMENT_GUIDE.md](docs/CLOUD_DEPLOYMENT_GUIDE.md)** for full step-by-step instructions.
+
+| Platform | Direct Kernel Support | Recommended Role | Guide Link |
+| :--- | :---: | :--- | :--- |
+| **AWS** (EC2 / EKS) | **Yes (Full)** | Nitro ENA Native XDP + LSM Core Defense Mesh | [AWS Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#3-aws-amazon-ec2--vpc-への実践導入手順) |
+| **GCP** (Compute Engine / GKE) | **Yes (Full)** | gVNIC XDP + LSM Core Defense Mesh | [GCP Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#4-gcp-google-compute-engine--vpc-への実践導入手順) |
+| **Microsoft Azure** (Azure VM / AKS) | **Yes (Full)** | MANA / Accelerated Networking XDP + LSM | [Azure Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#5-microsoft-azure-azure-virtual-machines--vnet-への実践導入手順) |
+| **Cloudflare** (WAF / Workers) | **Hybrid** | Edge L7 Sensor + Origin XDP Protection & API Sync | [Cloudflare Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
+| **Vercel** (Next.js / Edge) | **Hybrid Only** | Frontend Hosting + Backend Linux Mesh Protection | [Vercel Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |

@@ -8,7 +8,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-MODE="${1:-tui}" # tui | tui-enp | test | sync
+MODE="${1:-tui}" # tui | tui-enp | trace | test | sync
+
+if [ "$MODE" = "trace" ]; then
+  echo "=== [KERNEL TRACE STREAM] Watching Linux Kernel signal_generate (SIGKILL=9) & bpf_trace_printk (XDP_DROP) on pi-node ==="
+  echo "  (Keep this terminal open while pressing [a] -> [x] in the TUI terminal!)"
+  ssh -t pi-node '
+    sudo sh -c "
+      echo 1 > /sys/kernel/tracing/events/signal/signal_generate/enable
+      echo \"sig == 9\" > /sys/kernel/tracing/events/signal/signal_generate/filter
+      echo 1 > /sys/kernel/tracing/tracing_on
+      echo \"--- Listening to /sys/kernel/tracing/trace_pipe (Ctrl+C to stop) ---\"
+      cat /sys/kernel/tracing/trace_pipe
+    "
+  '
+  exit 0
+fi
 
 echo "=== [1/3] Preparing pi-node (/nix bind-mount & veth-victim testbed) ==="
 ssh pi-node '
@@ -29,8 +44,9 @@ ssh pi-node '
 '
 
 if [ "$MODE" = "test" ]; then
-  echo "=== [2/3] Running All 7 Proof Tests (Including Live Kernel XDP_DROP on pi-node) ==="
+  echo "=== [2/3] Running All 8 Proof Tests (Including Live Kernel XDP_DROP on pi-node) ==="
   TEST_BIN="$(ssh pi-node "ls -t ~/veil-mesh-consensus/target/debug/deps/veil_node-* | head -n 1")"
+  # shellcheck disable=SC2029
   ssh pi-node "sudo $TEST_BIN --nocapture --test-threads=1"
   exit 0
 fi
@@ -40,6 +56,7 @@ if [ "$MODE" = "tui-enp" ]; then
   IFACE="enp0s31f6"
 fi
 
-echo "=== [2/3] Attaching Live eBPF XDP (`veil_xdp_kern.o`) to `$IFACE` & Launching TUI Arena ==="
+echo "=== [2/3] Attaching Live eBPF XDP (veil_xdp_kern.o) to $IFACE & Launching TUI Arena ==="
 echo "  Controls inside TUI: [a] Spawn UDP Flood Process -> [b] Byzantine Spoof -> [x] Consensus Exterminate -> [q] Quit"
+# shellcheck disable=SC2029
 ssh -t pi-node "sudo ~/veil-mesh-consensus/target/release/veil-node --tui --iface $IFACE --ebpf-obj ~/veil-mesh-consensus/assets/veil_xdp_kern.o"

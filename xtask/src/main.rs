@@ -7,7 +7,10 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(name = "xtask", about = "veil-mesh-consensus build & eBPF orchestration tool")]
+#[command(
+    name = "xtask",
+    about = "veil-mesh-consensus build & eBPF orchestration tool"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -57,7 +60,9 @@ fn run_doctor() -> Result<()> {
                 println!("  [OK] {var} = {val} (exists: {exists})");
             }
             Err(_) => {
-                println!("  [WARN] {var} is not set (run inside `nix develop` or enable `direnv allow`)");
+                println!(
+                    "  [WARN] {var} is not set (run inside `nix develop` or enable `direnv allow`)"
+                );
             }
         }
     }
@@ -73,13 +78,12 @@ fn build_ebpf(release: bool) -> Result<()> {
     }
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&ebpf_dir)
-        .args([
-            "build",
-            "--target=bpfel-unknown-none",
-            "-Z",
-            "build-std=core",
-        ]);
+    cmd.current_dir(&ebpf_dir).args([
+        "build",
+        "--target=bpfel-unknown-none",
+        "-Z",
+        "build-std=core",
+    ]);
 
     if release {
         cmd.arg("--release");
@@ -105,10 +109,7 @@ fn gen_vmlinux(types: &[String]) -> Result<()> {
     let out_file = root.join("veil-ebpf/src/vmlinux.rs");
 
     let mut cmd = Command::new("aya-tool");
-    cmd.arg("generate")
-        .arg("--btf")
-        .arg(&vmlinux)
-        .args(types);
+    cmd.arg("generate").arg("--btf").arg(&vmlinux).args(types);
 
     let output = cmd.output().context("Failed to run `aya-tool generate`")?;
     if !output.status.success() {

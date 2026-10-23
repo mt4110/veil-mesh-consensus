@@ -6,17 +6,17 @@ use anyhow::Result;
 use clap::Parser;
 use consensus::{ConsensusRpc, ConsensusState, MeshCommand};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+#[cfg(any(test, target_os = "linux"))]
+use std::net::Ipv4Addr;
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "veil-node", about = "veil-mesh-consensus QUIC & eBPF node daemon")]
+#[command(
+    name = "veil-node",
+    about = "veil-mesh-consensus QUIC & eBPF node daemon"
+)]
 struct Args {
     /// Node identifier (e.g. `node-alpha` or `node-beta`)
     #[arg(long, default_value = "node-alpha")]
@@ -658,8 +658,12 @@ mod tests {
     /// 2. ステルス GC が直ちに発火し、ノードが保持していた機密鍵メモリ (`sensitive_key_material`) がゼロ消去（Zeroize）されること
     #[test]
     fn proof_4_ebpf_kernel_bridge_and_lsm_stealth_gc_zeroization() {
-        let bridge_alpha = Arc::new(MockEbpfBridge::new_with_secret(vec![0xDE, 0xAD, 0xBE, 0xEF]));
-        let bridge_beta = Arc::new(MockEbpfBridge::new_with_secret(vec![0xCA, 0xFE, 0xBA, 0xBE]));
+        let bridge_alpha = Arc::new(MockEbpfBridge::new_with_secret(vec![
+            0xDE, 0xAD, 0xBE, 0xEF,
+        ]));
+        let bridge_beta = Arc::new(MockEbpfBridge::new_with_secret(vec![
+            0xCA, 0xFE, 0xBA, 0xBE,
+        ]));
 
         // 1ノード（またはリーダー単体テスト）でブリッジ連動を検証するため、alpha + beta の2ノード構成で合意形成
         let mut alpha = ConsensusState::new("node-alpha", vec!["node-beta".into()])
@@ -703,7 +707,10 @@ mod tests {
             .unwrap()
             .get(&u32::from(attacker_ip))
             .expect("PeerPolicy must be written into kernel eBPF map");
-        assert_eq!(evaluate_peer_policy(Some(&kernel_peer_policy)), XdpVerdict::Drop);
+        assert_eq!(
+            evaluate_peer_policy(Some(&kernel_peer_policy)),
+            XdpVerdict::Drop
+        );
 
         // Step 4: `node-beta` の LSM フック (`veil_lsm_socket_connect`) が `-EPERM (-1)` で全ソケット接続を遮断し、
         //         ステルス GC によってメモリ上の機密鍵が完全にゼロ消去されたことを証明！
@@ -715,7 +722,11 @@ mod tests {
         );
         assert_eq!(beta.check_lsm_socket_connect(), -1);
         assert!(
-            bridge_beta.sensitive_key_material.lock().unwrap().is_empty(),
+            bridge_beta
+                .sensitive_key_material
+                .lock()
+                .unwrap()
+                .is_empty(),
             "Stealth GC must zeroize and clear sensitive key material in memory!"
         );
         assert_eq!(bridge_beta.stealth_gc_purge_count(), 1);
@@ -799,7 +810,10 @@ mod tests {
         let mut tampered_envelope: SignedConsensusRpc = id_alpha.sign_rpc(valid_ae);
 
         // ペイロード内の `trusted: false` を悪意をもって `trusted: true` に書き換える
-        if let ConsensusRpc::AppendEntries { ref mut entries, .. } = tampered_envelope.rpc {
+        if let ConsensusRpc::AppendEntries {
+            ref mut entries, ..
+        } = tampered_envelope.rpc
+        {
             entries[0].command = MeshCommand::set_trust(target_ip, true);
         }
 
@@ -890,28 +904,76 @@ mod tests {
 
         // 1. 初期状態では 10.99.0.66 -> 10.99.0.1 の ping が通ることを確認
         let ping_before = std::process::Command::new("ip")
-            .args(["netns", "exec", "ns-veil-rogue", "ping", "-c", "1", "-W", "1", "10.99.0.1"])
+            .args([
+                "netns",
+                "exec",
+                "ns-veil-rogue",
+                "ping",
+                "-c",
+                "1",
+                "-W",
+                "1",
+                "10.99.0.1",
+            ])
             .status()?;
-        assert!(ping_before.success(), "Ping must succeed before consensus XDP block");
+        assert!(
+            ping_before.success(),
+            "Ping must succeed before consensus XDP block"
+        );
 
         // 2. コンセンサス合意により `PEER_POLICY_MAP` に `10.99.0.66 -> trusted=false` を書き込む
-        bridge.sync_peer_policy(u32::from(attacker_ip), veil_common::PeerPolicy::new(false, 1))?;
+        bridge.sync_peer_policy(
+            u32::from(attacker_ip),
+            veil_common::PeerPolicy::new(false, 1),
+        )?;
 
         // 3. 再度 ping を打つと、カーネル NIC (`veth-victim`) の XDP 層で `XDP_DROP` され 100% タイムアウト（遮断）されることを証明！
         let ping_blocked = std::process::Command::new("ip")
-            .args(["netns", "exec", "ns-veil-rogue", "ping", "-c", "1", "-W", "1", "10.99.0.1"])
+            .args([
+                "netns",
+                "exec",
+                "ns-veil-rogue",
+                "ping",
+                "-c",
+                "1",
+                "-W",
+                "1",
+                "10.99.0.1",
+            ])
             .status()?;
-        assert!(!ping_blocked.success(), "Ping MUST be dropped at XDP layer when trusted=0!");
+        assert!(
+            !ping_blocked.success(),
+            "Ping MUST be dropped at XDP layer when trusted=0!"
+        );
 
         let (_pass_cnt, drop_cnt) = bridge.read_xdp_counters().unwrap_or((0, 0));
-        assert!(drop_cnt >= 1, "Kernel PACKETS_SEEN_MAP[1] (XDP_DROP) counter must increment!");
+        assert!(
+            drop_cnt >= 1,
+            "Kernel PACKETS_SEEN_MAP[1] (XDP_DROP) counter must increment!"
+        );
 
         // 4. 信頼回復 (`trusted=true`) を書き込むと、即座に ping が復活することを証明！
-        bridge.sync_peer_policy(u32::from(attacker_ip), veil_common::PeerPolicy::new(true, 2))?;
+        bridge.sync_peer_policy(
+            u32::from(attacker_ip),
+            veil_common::PeerPolicy::new(true, 2),
+        )?;
         let ping_restored = std::process::Command::new("ip")
-            .args(["netns", "exec", "ns-veil-rogue", "ping", "-c", "1", "-W", "1", "10.99.0.1"])
+            .args([
+                "netns",
+                "exec",
+                "ns-veil-rogue",
+                "ping",
+                "-c",
+                "1",
+                "-W",
+                "1",
+                "10.99.0.1",
+            ])
             .status()?;
-        assert!(ping_restored.success(), "Ping must recover immediately after consensus restores trust!");
+        assert!(
+            ping_restored.success(),
+            "Ping must recover immediately after consensus restores trust!"
+        );
 
         Ok(())
     }
@@ -937,10 +999,18 @@ mod tests {
 
         let mut beta = ConsensusState::new(
             "node-beta",
-            vec!["node-alpha".into(), "node-gamma".into(), "node-delta".into()],
+            vec![
+                "node-alpha".into(),
+                "node-gamma".into(),
+                "node-delta".into(),
+            ],
         );
         beta.register_peer_public_keys(pub_keys);
-        assert_eq!(beta.quorum_size(), 3, "4-node cluster requires 2f+1 = 3 signatures for Quorum!");
+        assert_eq!(
+            beta.quorum_size(),
+            3,
+            "4-node cluster requires 2f+1 = 3 signatures for Quorum!"
+        );
 
         // 1. リーダー alpha が正規エントリ (10.0.0.99 を遮断) を beta に送信
         let honest_entry = LogEntry {
@@ -958,7 +1028,12 @@ mod tests {
             commit_qc: None,
         };
         let resp = beta.handle_rpc(ae_honest).unwrap();
-        if let ConsensusRpc::AppendEntriesResponse { success, entry_hash, .. } = resp {
+        if let ConsensusRpc::AppendEntriesResponse {
+            success,
+            entry_hash,
+            ..
+        } = resp
+        {
             assert!(success);
             assert_eq!(entry_hash, honest_entry.digest());
         }
@@ -981,7 +1056,10 @@ mod tests {
         };
         let resp_eq = beta.handle_rpc(ae_equivocate).unwrap();
         if let ConsensusRpc::AppendEntriesResponse { success, .. } = resp_eq {
-            assert!(!success, "Follower MUST reject conflicting log entry at same (term, index)!");
+            assert!(
+                !success,
+                "Follower MUST reject conflicting log entry at same (term, index)!"
+            );
         }
         assert_eq!(beta.rejected_byzantine_packets, 1);
 

@@ -214,7 +214,9 @@ impl TuiArenaApp {
                 .filter(|&&n| n != name)
                 .map(|&s| s.to_string())
                 .collect();
-            let bridge = Arc::new(MockEbpfBridge::new_with_secret(vec![0xAA, 0xBB, 0xCC, 0xDD]));
+            let bridge = Arc::new(MockEbpfBridge::new_with_secret(vec![
+                0xAA, 0xBB, 0xCC, 0xDD,
+            ]));
             let mut st = ConsensusState::new(name, peers).with_ebpf_bridge(bridge.clone());
             st.register_peer_public_keys(pub_keys.clone());
             self.bridges.insert(name.to_string(), bridge);
@@ -383,7 +385,8 @@ impl TuiArenaApp {
 
             // (C) 実 Linux カーネル eBPF ブリッジが接続されている場合は、カーネル内の実 `PEER_POLICY_MAP` にも即時書き込む！
             if let Some(ref real_bridge) = self.real_kernel_bridge {
-                let policy = veil_common::PeerPolicy::new(false, self.nodes[&leader_id].commit_index as u32);
+                let policy =
+                    veil_common::PeerPolicy::new(false, self.nodes[&leader_id].commit_index as u32);
                 let _ = real_bridge.sync_peer_policy(u32::from(ip), policy);
                 self.log(format!(
                     "SYSCALL BPF: sys_bpf(BPF_MAP_UPDATE_ELEM, map=PEER_POLICY_MAP, key={ip}, trusted=0) -> XDP_DROP active!"
@@ -555,7 +558,11 @@ fn draw_dashboard(f: &mut Frame, app: &TuiArenaApp, auto_demo: bool) {
             app.total_xdp_pass, app.total_xdp_drop
         )),
     ]))
-    .block(Block::default().borders(Borders::ALL).title(" System Overview "));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" System Overview "),
+    );
     f.render_widget(header, chunks[0]);
 
     // 2. Consensus Nodes Table
@@ -581,7 +588,10 @@ fn draw_dashboard(f: &mut Frame, app: &TuiArenaApp, auto_demo: bool) {
             } else {
                 Color::Cyan
             };
-            ListItem::new(Line::from(Span::styled(msg.clone(), Style::default().fg(color))))
+            ListItem::new(Line::from(Span::styled(
+                msg.clone(),
+                Style::default().fg(color),
+            )))
         })
         .collect();
     let logs_widget = List::new(log_items).block(
@@ -593,18 +603,45 @@ fn draw_dashboard(f: &mut Frame, app: &TuiArenaApp, auto_demo: bool) {
 
     // 5. Footer Controls
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" [a] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [a] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("Spawn Mock Attack Process (OS PID)   "),
-        Span::styled(" [b] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [b] ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("Inject Byzantine Forged RPC   "),
-        Span::styled(" [x] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [x] ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("Consensus Exterminate (XDP_DROP + LSM + Kill)   "),
-        Span::styled(" [r] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [r] ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("Reset   "),
-        Span::styled(" [q] ", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " [q] ",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("Quit"),
     ]))
-    .block(Block::default().borders(Borders::ALL).title(" Tactical Controls "));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Tactical Controls "),
+    );
     f.render_widget(footer, chunks[4]);
 }
 

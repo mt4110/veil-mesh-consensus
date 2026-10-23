@@ -1,8 +1,12 @@
 # 🛡️ veil-mesh-consensus
 
-English version is available at [README_EN.md](README_EN.md).
+[![CI Checks](https://github.com/mt4110/veil-mesh-consensus/actions/workflows/ci.yml/badge.svg)](https://github.com/mt4110/veil-mesh-consensus/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/mt4110/veil-mesh-consensus)](https://github.com/mt4110/veil-mesh-consensus/releases)
 
-**QUIC (`Tokio` + `quinn`) トランスポート上のビザンチン耐性コンセンサス（Raft + Ed25519 署名検証）と、Linux カーネル空間の eBPF (`Aya` XDP パケットフィルタ & LSM `lsm=bpf` ステルス GC) を直結した自律型メッシュ防衛・攻撃駆逐基盤です。**
+[English](README_EN.md) · [☁️ クラウド導入ガイド (AWS/GCP/Azure/CF/Vercel)](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 8大証明解説書](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
+
+**QUIC (`Tokio` + `quinn`) トランスポート上のビザンチン耐性コンセンサス（Raft + Ed25519 署名検証 + SHA-256 ダイジェスト & マルチシグ `QuorumCertificate`）と、Linux カーネル空間の eBPF (`Aya` XDP パケットフィルタ & LSM `lsm=bpf` ステルス GC) を直結した自律型メッシュ防衛・攻撃駆逐基盤です。**
 
 ![Autonomous Attack Extermination Flow](./assets/extermination-flow.svg)
 
@@ -15,8 +19,10 @@ English version is available at [README_EN.md](README_EN.md).
 <!-- rgc:end -->
 
 > **🎥 上記 GIF デモ（`[a]` $\to$ `[b]` $\to$ `[x]` 操作）で実際に起きていること**
+>
 > - **左画面 (`sudo iftop -i veth-victim`)**: 実機 Linux (`pi-node`: Kernel 7.0 x86_64) の NIC 着信トラフィックをリアルタイム監視。
 > - **右画面 (`veil-node --tui`)**: カーネルの `veth-victim` に実 eBPF バイトコード (`veil_xdp_kern.o`) をアタッチした TUI アリーナ。
+>
 > 1. **`[a]` キー押下（モック攻撃プロセス起動）**: 隔離名前空間 (`ns-veil-rogue`, `10.99.0.66`) 上で秒間 1,000 発の UDP Flood を送出する実 OS プロセスが起動し、左画面 `iftop` のトラフィックバーが跳ね上がります。
 > 2. **`[b]` キー押下（ビザンチン偽造 RPC 注入）**: リーダー `node-alpha` になりすました偽造コンセンサスパケット (`Term 999`) を注入。全3ノードが **Ed25519 公開鍵検証** で即座に検知・破棄します（紫色ログ）。
 > 3. **`[x]` キー押下（コンセンサス合意 & カーネル eBPF 一斉駆逐）**: 3ノードの過半数合意（Quorum 3/3）が成立した瞬間、`sys_bpf(BPF_MAP_UPDATE_ELEM)` でカーネルの `PEER_POLICY_MAP` が `trusted=0` に更新され、NIC 層での **`XDP_DROP` 即時遮断**・**Stealth GC 機密メモリゼロ消去 (`ZEROIZED`)**・**`sys_kill(PID, SIGKILL=9)` による攻撃プロセス強制抹殺**が同時発動し、`iftop` の攻撃通信が完全に鎮圧されます。
@@ -56,6 +62,7 @@ flowchart LR
 ```
 
 ### 各コンポーネントの役割分担
+
 1. **[`veil-warden`](https://github.com/mt4110/veil-warden)（ローカル観測・プロセス接続制御）**:
    - 各 Linux ノード内でプロセスの新規 TCP 接続試行（PID/TID・宛先）や起動引数を監視し、不審な通信を検知します。
 2. **`veil-mesh-consensus`（分散合意・集団免疫の脳）**:
@@ -70,17 +77,20 @@ flowchart LR
 
 ## 🛡️ ビザンチン将軍問題（悪意あるノードの出現）に対する突破確率と耐性分析
 
-**Q. 「もしクラスタ内に裏切り者（ビザンチン将軍＝悪意あるノードや乗っ取られたノード）が現れたら突破されてしまいますか？その確率は？」**
+### Q. 「もしクラスタ内に裏切り者（ビザンチン将軍＝悪意あるノードや乗っ取られたノード）が現れたら突破されてしまいますか？その確率は？」
 
 結論から言うと、**「外部からのなりすまし・通信改ざん」によって突破される確率は天文学的にゼロ（$2^{-128}$ 以下）**であり、**「内部ノードの秘密鍵ごと乗っ取られた場合」でも過半数（Quorum）を同時に制圧されない限り、クラスタの合意は突破されません。**
 
 ### 1. 外部攻撃者・なりすまし将軍が署名を偽造できる確率： $\le 2^{-128}$ （事実上 0%）
+
 すべてのコンセンサス RPC (`RequestVote` / `AppendEntries`) は **Ed25519（Curve25519 上の Schnorr 署名、128ビットセキュリティ水準）** で署名・検証されます（[`handle_signed_rpc`](veil-node/src/consensus.rs)）。
+
 - 秘密鍵を持たない攻撃者が、正規リーダー（例: `node-alpha`）になりすまして有効な署名を当て推量で偽造できる確率は：
   $$P(\text{Signature Forgery}) \approx \frac{1}{2^{128}} \approx 2.9 \times 10^{-39}$$
 - また、正規リーダーが送信したパケットを途中で傍受し、`trusted: false`（遮断）を `trusted: true`（許可）に **1ビットでも書き換えた場合、Ed25519 検証が 100% 失敗して即座に破棄**されます（`proof_5` で実証済み）。
 
 ### 2. クラスタ内部のノードが乗っ取られた場合（内部ビザンチン耐性）
+
 万が一、クラスタ内のノード自身がマルウェア等に侵害され、正規の Ed25519 秘密鍵を使って「嘘の投票」や「不正な提案」を行った場合の挙動は以下の通りです。
 
 | 攻撃シナリオ | 突破されるか？ | 数学的・実装的根拠 |
@@ -98,6 +108,7 @@ flowchart LR
 ## 🖥️ インタラクティブ TUI アリーナ & 実機 `pi-node` 連携コマンド
 
 ### 1. Mac ローカルでの TUI 起動
+
 ```bash
 # 対話モードで TUI アリーナを起動
 cargo run -p veil-node -- --tui
@@ -107,6 +118,7 @@ cargo run -p veil-node -- --tui-demo
 ```
 
 ### 2. 実機 Linux (`pi-node`: Kernel 7.0) での実カーネル XDP + `iftop` + トレース連動
+
 ```bash
 # ターミナル1: pi-node の仮想攻撃NIC (veth-victim) を iftop で監視
 ssh -t pi-node "sudo iftop -i veth-victim -n -N -P"
@@ -130,7 +142,7 @@ bash scripts/deploy-pi-node.sh tui
 
 ---
 
-## 🧪 7つの数学的・実機カーネル証明テスト（`veil-arena` 連携対応）
+## 🧪 8つの数学的・実機カーネル証明テスト（`veil-arena` 連携対応）
 
 詳細は [docs/CONSENSUS_AND_EBPF_PROOF.md](docs/CONSENSUS_AND_EBPF_PROOF.md) を参照してください。
 
@@ -138,7 +150,7 @@ bash scripts/deploy-pi-node.sh tui
 # Mac / Linux 共通の証明テスト実行
 cargo test --workspace -- --nocapture
 
-# pi-node 実機 Linux カーネル上での全7証明テスト（実 XDP_DROP 検証含む）
+# pi-node 実機 Linux カーネル上での全8証明テスト（実 XDP_DROP 検証含む）
 bash scripts/deploy-pi-node.sh test
 
 # veil-arena 準拠の証拠保存付きスモーク実行 (artifacts/ にログと summary.json を出力)
@@ -172,6 +184,21 @@ nix run .#node-beta
 ```
 
 ### GIF デモの再生成（`readme-gif-crafter` 連携）
+
 ```bash
 bash scripts/update-demo.sh
 ```
+
+---
+
+## ☁️ クラウド・エッジ環境への実践導入（AWS / GCP / Azure / Cloudflare / Vercel）
+
+各クラウド・エッジサービスにおける eBPF XDP / LSM の対応可否マトリクスと、ステップバイステップの構築手順（VPC セキュリティグループ / NSG 設定、ENA / gVNIC / MANA ドライバ設定、`systemd` 常駐ユニット定義、Cloudflare / Vercel とのハイブリッド構成）については、専用ドキュメント **[docs/CLOUD_DEPLOYMENT_GUIDE.md](docs/CLOUD_DEPLOYMENT_GUIDE.md)** を参照してください。
+
+| プラットフォーム | 直接導入 | 推奨ロール | 詳細ガイド |
+| :--- | :---: | :--- | :--- |
+| **AWS** (EC2 / EKS) | **◎ 完全対応** | Nitro ENA Native XDP + LSM コア防衛メッシュ | [AWS 導入手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#3-aws-amazon-ec2--vpc-への実践導入手順) |
+| **GCP** (Compute Engine / GKE) | **◎ 完全対応** | gVNIC XDP + LSM コア防衛メッシュ | [GCP 導入手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#4-gcp-google-compute-engine--vpc-への実践導入手順) |
+| **Microsoft Azure** (Azure VM / AKS) | **◎ 完全対応** | MANA / Accelerated Networking XDP + LSM | [Azure 導入手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#5-microsoft-azure-azure-virtual-machines--vnet-への実践導入手順) |
+| **Cloudflare** (WAF / Workers) | **△ 連携対応** | 前段 L7 センサー ＋ オリジン XDP 保護 & API 遮断同期 | [Cloudflare 連携手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
+| **Vercel** (Next.js / Edge) | **✕ 単体不可** | フロントエンド配置 ＋ 裏側バックエンド API クラスタを保護 | [Vercel 連携手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
