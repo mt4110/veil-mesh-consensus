@@ -1,4 +1,23 @@
-# 🛡️ veil-mesh-consensus
+# DEVELOPMENT DISCONTINUED — veil-mesh-consensus
+
+> [!CAUTION]
+> **Development ended on October 27, 2026. This repository preserves experimental research. Production deployment is not recommended.**
+>
+> **No further maintenance, features, or security fixes are planned. The GitHub repository is retained as a read-only archive.**
+
+## Why development ended
+
+- The original goal was cooperative defense across servers without allowing one compromised server to cause unjustified blocking on healthy peers. Practical fulfillment of that goal was not demonstrated. The later single-host manual temporary-BAN tool does not fulfill it.
+- Privileged operations and dependencies on kernels, NICs, drivers, and cloud runtimes impose deployment and maintenance costs. Benefits sufficient to justify those costs over existing alternatives were not demonstrated.
+- Isolated tests and selected-host successes and failures remain research evidence. General cloud compatibility and safe public-site pilot acceptance were not achieved. Further development and paid experiments have ended.
+
+This is not a claim that all software requiring sudo is inappropriate or that GCP and AWS prohibit eBPF in general. The decision concerns this project's goal, implementation, deployment burden, and demonstrated benefits.
+
+Code, history, existing uncommitted work, and local trial evidence are preserved. The GitHub code is not identical to later local changes and trial records. **The installation instructions, designs, and roadmaps below are historical experiment records, not current deployment recommendations or plans to resume development.**
+
+---
+
+## 🛡️ veil-mesh-consensus
 
 [![CI Checks](https://github.com/mt4110/veil-mesh-consensus/actions/workflows/ci.yml/badge.svg)](https://github.com/mt4110/veil-mesh-consensus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
