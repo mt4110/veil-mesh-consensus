@@ -1,26 +1,28 @@
-# 実践投入に向けたレビューと改訂設計案
+# 初期版レビューと未完の改訂設計案（開発終了）
 
 評価日: 2026-10-23（Asia/Tokyo）  
 対象: `c8d3f7f` の設計書、指定された5実装ファイル、および実行経路・eBPF・関連テスト・CI・導入手順  
-状態: **レビューと設計提案。実装変更・本番導入の承認ではない。**
+状態: **過去のレビュー・未完の設計提案。開発終了。本番導入の承認ではない。**
+
+2026-10-27訂正。第1〜11節の実装所見・再現結果は、原則として当時の対象 `c8d3f7f` に関する記録です。後続の公開mainではprefix hash・鍵mode・apply error等に変更があり、同じ欠陥がすべて残ると断定しません。後続版の部分修正を一般的なBFT保証とも扱いません。現在の公開コードとの区別は[確認状況](VALIDATION_STATUS.md)を参照してください。第12節も未完の設計候補であり、前節を置き換える安全性証明ではありません。
 
 ## 1. 判断
 
-**現行実装は、本番で自動遮断を担う状態には達していない。** これは「さらにテストを増やせば安心」という程度の不足ではない。正常な署名と3/4の定足数があっても、誠実なノードが異なる遮断状態を確定する反例を再現した。通常デーモンの独立プロセス間通信、Linuxテストのビルド、成功応答と実際の執行にも具体的な問題がある。
+**レビュー対象版は、本番で自動遮断を担う状態には達していなかった。** これは「さらにテストを増やせば安心」という程度の不足ではない。正常な署名と3/4の定足数があっても、誠実なノードが異なる遮断状態を確定する反例を再現した。通常デーモンの独立プロセス間通信、Linuxテストのビルド、成功応答と実際の執行にも具体的な問題がある。
 
-一方、隔離されたLinuxのvethでは、配布済みeBPFオブジェクトによる `PASS → DROP → PASS` を確認できた。署名検証、境界検査、テスト可能な状態機械、執行ポートは今後の材料になる。ただし、その部品の動作から分散システム全体の保証へ飛躍してはならない。
+一方、隔離されたLinuxのvethでは、配布済みeBPFオブジェクトによる `PASS → DROP → PASS` を確認できた。署名検証、境界検査、テスト可能な状態機械、執行ポートは当時の検討材料となった。ただし、その部品の動作から分散システム全体の保証へ飛躍してはならない。
 
 目指すべき成果は「200行のBFT」や「11個の証明」ではなく、**対象サイトで正常利用者への影響を抑え、必要な遮断を実行し、失敗を見える形で扱い、運用者が復旧できること**である。
 
-| ゴール | 今回の扱い |
+| 当時のゴール | 初期レビュー時の扱い |
 | --- | --- |
 | 最終ゴール | 小規模サイトから実践投入できる、維持可能な防御手段にする |
-| 現在のマイルストーン | 現行の保証と限界を確定し、必要な実装・検証と採用判断を絞る |
+| 当時のマイルストーン | 当時の保証と限界を確定し、必要な実装・検証と採用判断を絞る |
 | 今回のタスク | 根拠付きレビュー、反例、改訂設計、実装順序を引き渡す |
 | 導入先 | **未決定**。ユーザーの回答に従い構成別の条件を示す |
 | 未決定事項 | 本番でBFTが必須か、対象サイト、許容誤遮断、運用時間・費用の上限 |
 
-原設計書は保存する。本書を採用する場合も、未合意の信頼モデル変更や追加機能を自動的に実装しない。
+訂正前の原設計・レビューはGit履歴で保存する。本書を採用する場合も、未合意の信頼モデル変更や追加機能を自動的に実装しない。
 
 ## 2. 今回確認したことと証拠の限界
 
@@ -30,11 +32,11 @@
 | --- | --- | --- |
 | macOS arm64、Rust 1.98.1、`cargo test --workspace --locked --offline` | 既存10件成功。Linux専用 `proof_7` は対象外 | Linux動作、独立OSプロセスのクラスタ、本番安全性 |
 | macOSのformat、Clippy（workspace/all-targets、警告をエラー扱い） | 成功 | Linux限定部分のコンパイルやセキュリティ保証 |
-| pi-node、Linux 7.0.0-38-generic x86_64、Rust 1.98.1、現HEADのテストビルド | **失敗**。`proof_tests.rs:424` のモジュール参照でE0433 | Linux CI成功とは扱えない |
+| pi-node、Linux 7.0.0-38-generic x86_64、Rust 1.98.1、レビュー対象HEADのテストビルド | **失敗**。`proof_tests.rs:424` のモジュール参照でE0433 | Linux CI成功とは扱えない |
 | Linux検証コピーで上記参照だけ `crate::ebpf_bridge` に補正し `proof_7` を実行 | 既存の隔離vethで疎通・遮断・解除を実測 | 無変更HEADの合格、BFT、多ホスト、IPv6、TTL、耐負荷 |
 | コピーに追加したmacOS反例8件 | 欠陥の存在をassertして成功 | 修正後の回帰試験の合格とは逆の意味 |
 | Linuxの `BPF_PROG_TEST_RUN`、配布object、interfaceへのattachなし | 通常source portはDROP、22/10023はPASS。257件目map更新は拒否 | 実TCP接続の成立や耐負荷。合成frameへのkernel判定を確認したもの |
-| 現mainから起動した独立2プロセス | 双方mTLSで `BadSignature`、成功Pingなし | TLSライブラリが壊れているという意味ではない |
+| 当時のmainから起動した独立2プロセス | 双方mTLSで `BadSignature`、成功Pingなし | TLSライブラリが壊れているという意味ではない |
 
 依存は既存のロックファイルとキャッシュ／pi-nodeの既存vendorを使用した。依存追加、既知脆弱性DBの網羅照合、クラウド・本番検証は行っていない。ワークスペースのCargo版番号は `0.1.0` であり、文書の「v0.2.0」と版管理上のずれがある。
 
@@ -42,11 +44,11 @@
 
 ### 2.2 「証明」と呼ぶ範囲
 
-`proof_1`〜`proof_11` は特定シナリオの検証・回帰テストである。任意のメッセージ順序、再起動、侵害ノードの振る舞いを尽くした数学的証明ではない。`proof_2` は同一OSプロセス内の4状態機械と実UDP/mTLS通信を使い、公開鍵を手動登録する。`proof_7` は現在、オブジェクト/NIC欠落やattach失敗でも `Ok(())` を返す。CIの「成功件数」から実カーネル試験の実行を推定してはならない。
+`proof_1`〜`proof_11` は特定シナリオの検証・回帰テストである。任意のメッセージ順序、再起動、侵害ノードの振る舞いを尽くした数学的証明ではない。`proof_2` は同一OSプロセス内の4状態機械と実UDP/mTLS通信を使い、公開鍵を手動登録する。対象版の `proof_7` は、オブジェクト/NIC欠落やattach失敗でも `Ok(())` を返す。CIの「成功件数」から実カーネル試験の実行を推定してはならない。
 
 ## 3. 実装の主要所見
 
-P1は本番投入を止める問題、P2は採用設計・運用条件として解消する問題とする。優先度はテスト数ではなく、保証への影響で決める。以下の行番号は対象コミットのもの。
+P1は本番投入を止める問題、P2は採用設計・運用条件として解消する問題とする。優先度はテスト数ではなく、保証への影響で決める。以下のコード行番号は対象コミットのものです。第4節の原設計行番号も訂正前の文書を指し、現在の文書の行番号ではありません。
 
 ### R1 / P1: 末尾QCが、その前のログの一致を証明していない
 
@@ -76,7 +78,7 @@ A/B/Cの署名で値XのQCを作りBだけへ配送した後、Aがterm2の値Y�
 
 各プロセスの `OnceLock` が別々のCAを生成し、そのCAだけを信頼する。共有trust bundleを読み込む経路がない。さらに `--peer` から実ノードIDと対応しないIDを作り、相手の署名公開鍵を登録せず、通常送信ループはPingのみである。選挙、提案受付、複製を駆動する運用runtimeがない。
 
-共有CAを作るだけでは完了しない。静的メンバー定義、証明書とnode IDの対応、公開鍵配布、駆動ループ、管理入力を一体で検証する必要がある。現在のCloud導入ガイドは、予定された機能を実行可能な手順のように読めるため訂正対象となる。
+共有CAを作るだけでは完了しない。静的メンバー定義、証明書とnode IDの対応、公開鍵配布、駆動ループ、管理入力を一体で検証する必要がある。当時のCloud導入ガイドは、予定された機能を実行可能な手順のように読めるため訂正対象となる。
 
 ### R4 / P1: 未commit・未執行を成功として扱う
 
@@ -126,13 +128,13 @@ pi-nodeの実カーネルで、配布objectへ合成Ethernet/IPv4/TCP frameを�
 
 ### R11 / P2: ガード・資源制限・デモの境界を明記する
 
-- 既定保護IPは `127.0.0.1` と `0.0.0.0` の2個。管理網・全loopback・peer・gatewayの保護設定は通常起動に配線されていない。CIDR、IPv6、TTLは現在のコマンド型にない。
+- 既定保護IPは `127.0.0.1` と `0.0.0.0` の2個。管理網・全loopback・peer・gatewayの保護設定は通常起動に配線されていない。CIDR、IPv6、TTLは対象版のコマンド型にない。
 - RPC/QCにcluster IDや設定epochがない。同じ鍵を別環境や復元環境で再利用すると、リプレイの境界が曖昧になる。
 - 受信64KiBは、接続数・QUIC window・同時task・署名検証queue全体の資源上限ではない。接続、stream、deadline、rate、queueを別々に制限する。
 - `proof_9` の偽造RPCは未知の署名者として拒否され得る。既知署名者の不正署名も、実wire上で別途確認する。
 - 起動時のeBPF attach失敗はQUIC-onlyで継続する。執行を要求した運用ではreadiness失敗にする。
 - TUIの「XDP active」表示にも書込み失敗無視があり、resetは実mapを初期化しない。デモ操作を運用APIに流用しない。
-- 現在のLSM/ダミー鍵消去の実演を、PHPアプリやホスト全体の保護の証拠にしない。入出力の方向が違うWarden検知を、そのままWeb攻撃元IPに変換しない。
+- 対象版のLSM/ダミー鍵消去の実演を、PHPアプリやホスト全体の保護の証拠にしない。入出力の方向が違うWarden検知を、そのままWeb攻撃元IPに変換しない。
 
 ## 4. v1設計書に対する修正要求
 
@@ -151,7 +153,7 @@ pi-nodeの実カーネルで、配布objectへ合成Ethernet/IPv4/TCP frameを�
 
 HotStuff-2の著者解説では、最高lockを知り、他のノードを安全に進行させる条件が主要な論点であり、場合によってview同期後の待機も必要になる。「TC内の最大termのQCを選ぶ」だけから同じ保証は導けない。[HotStuff-2著者による方式比較](https://decentralizedthoughts.github.io/2023-04-01-hotstuff-2/)
 
-LPMの指摘は、lookupが最長一致の値を1つ返す仕様と原設計のTTL分岐から導いた設計上の反例である。現行にLPM実装はないため、現行バイナリで発生した障害とは区別する。[Linux 6.10 LPM仕様](https://www.kernel.org/doc/html/v6.10/bpf/map_lpm_trie.html)
+LPMの指摘は、lookupが最長一致の値を1つ返す仕様と原設計のTTL分岐から導いた設計上の反例である。レビュー対象版にLPM実装はないため、そのバイナリで発生した障害とは区別する。[Linux 6.10 LPM仕様](https://www.kernel.org/doc/html/v6.10/bpf/map_lpm_trie.html)
 
 ## 5. 採用方針: 用途・信頼モデルを選んでから実装する
 
@@ -175,7 +177,7 @@ Cloudflareは元IPをheaderでoriginへ渡すことを説明している。heade
 | 既存WAF/rate limit、既存nftablesのtimeout set | 既存機能で対象siteの問題を解ける | 独自のBFT | **最初の比較対象**。十分なら本作を本番経路に追加しない |
 | 信頼する1つのcontrollerが期限付き決定を署名しagentへ配信 | 1人/同一運用組織、controller侵害を脅威モデルの外に置ける | controllerのByzantine耐性、単独障害時の新規決定継続 | **小規模pilot向け提案**。信頼モデルの明示的な採用が必要 |
 | CFTの既存replicated logを使うcontroller | controllerの停止耐性が必要で、悪意あるcontrollerは想定しない | Byzantine耐性 | 稼働実績が必要になってから選定。署名を加えてもBFTにはならない |
-| 4 validator/3票の既知BFT方式 | 「1台の侵害で他ノードの合意を破壊できない」が必須で、運用費を許容できる | 侵害rootのローカル保護、誤検知防止、共通管理鍵や共通脆弱性の侵害 | **条件付き研究・製品候補**。現行hybridに継ぎ足して本番化しない |
+| 4 validator/3票の既知BFT方式 | 「1台の侵害で他ノードの合意を破壊できない」が必須で、運用費を許容できる | 侵害rootのローカル保護、誤検知防止、共通管理鍵や共通脆弱性の侵害 | **条件付き研究・製品候補**。レビュー対象hybridに継ぎ足して本番化しない |
 
 nftablesには要素ごとのtimeoutがある。独自TTLを作る前に、この既存機能と同じ負荷・期限・復旧条件で比較する。[nftables Element timeouts](https://wiki.nftables.org/wiki-nftables/index.php/Element_timeouts)
 
@@ -185,7 +187,7 @@ Raftの原論文は非Byzantineの停止故障を前提としている。信頼�
 
 ## 6. 共通の最小製品設計
 
-以下は未実装の改訂案。中央配信と将来のBFTが共通に使える責務だけを定め、将来拡張のためだけの汎用基盤は作らない。
+以下は当時の未実装の改訂案であり、現在の採用・実装状況を示すものではない。中央配信と将来のBFTが共通に使える責務だけを定め、将来拡張のためだけの汎用基盤は作らない。
 
 ### 6.1 責務と境界
 
@@ -273,7 +275,7 @@ XDPのpin方針は実装前に1つ選ぶ。初回案ではunpinの所有linkを�
 - 分断時は安全性を維持する。新規合意が止まってもローカル期限と管理復旧は機能する。
 - 再起動・snapshot復旧・古いバックアップ復元によって投票履歴を巻き戻さない。判断不能ならvalidatorとして投票を再開しない。
 
-N=4、f=1、q=3なら、2つのquorumの交差は最低2台であり、うち最低1台は誠実である。この計算が意味を持つには、**その誠実nodeが永続的に矛盾投票を拒否する状態遷移**が必要。現行実装はR1/R2によりその前提を満たさない。
+N=4、f=1、q=3なら、2つのquorumの交差は最低2台であり、うち最低1台は誠実である。この計算が意味を持つには、**その誠実nodeが永続的に矛盾投票を拒否する状態遷移**が必要。レビュー対象版はR1/R2によりその前提を満たさない。
 
 ### 7.2 既存方式の選定
 
@@ -293,7 +295,7 @@ membership/key rotationは、旧構成と新構成の両方が独立して成立
 
 ### 7.4 研究の終了条件
 
-検証する問いは「静的4node、1 Byzantineとクラッシュ再起動の下で、同じ位置の決定が一意に保たれ、通信が安定した後に進行するか」。現在の製品への接続は、採用が決まった場合の決定方式の置換に限る。
+検証する問いは「静的4node、1 Byzantineとクラッシュ再起動の下で、同じ位置の決定が一意に保たれ、通信が安定した後に進行するか」。当時の製品への接続案は、採用が決まった場合の決定方式の置換に限る。
 
 終了条件は、参照方式と差分の確定、モデル検査の範囲・未検査条件の明記、R1/R2と再起動反例の否定、実runtimeとのtrace照合である。新規方式の発明や行数削減は研究目標にしない。必要性・保守負担・時間予算が合意されない場合、研究を継続して主力プロダクトを止めない。
 
@@ -328,7 +330,7 @@ local bypassはサービス再起動やReconcilerで勝手に再有効化され�
 
 | 段階 | 実装/判断 | 完了条件 | 中止・保留条件 |
 | --- | --- | --- | --- |
-| G0: 証拠と説明の整合 | R1〜R11の管理、Linux build、現機能/予定/デモの分離 | 正常系と負例の実行範囲が分かり、未実装手順を現行機能として案内しない | 現行hybridを安全と表示したまま配布しない |
+| G0: 証拠と説明の整合 | R1〜R11の管理、Linux build、対象版の機能/予定/デモの分離 | 正常系と負例の実行範囲が分かり、未実装手順を現行機能として案内しない | レビュー対象hybridを安全と表示したまま配布しない |
 | G1: 用途の確認 | 1site/topology/痛点/許容影響/信頼モデルを決め、既存WAF等と比較 | 実利用の入力から、既存手段で不足する点を具体的に示せる | 既存機能で十分、期待する誤検知・運用負担を改善できない |
 | G2: 局所執行 | exact IP、認証済み入力、期限、ガード、状態報告、解除を1backendで実装 | 通常通信、管理経路、TTL、再適用、reboot、map full、部分失敗、bypassを隔離Linuxで確認 | 誤報や解除不能を残さない |
 | G3: 配信と復旧 | 採用した決定方式、静的設定、鍵、永続化、分割catch-up | 独立OSプロセスで開始・停止・再接続・再起動・不達が仕様どおり。構成に必要なら別ホストでも実施 | 同一プロセスの成功を代用しない。BFT必須なら第7節完了前に進めない |
@@ -348,13 +350,13 @@ local bypassはサービス再起動やReconcilerで勝手に再有効化され�
 
 単体・状態機械・独立プロセス・実kernel・実siteの結果を別々に記録する。モデル検査やfuzzingも、範囲と入力モデルを示す。有限試験の成功を一般的な安全性の証明とは呼ばない。
 
-## 11. 次の設計担当者への依頼文
+## 11. 当時の設計引継ぎ案（終了）
 
-以下を、そのまま次の設計レビューへ渡せる。
+以下は当時の引継ぎ案の記録です。現在の開発再開依頼や追加作業の承認ではありません。
 
 > `docs/FEASIBILITY_REVIEW_AND_V1_DESIGN.md` と原設計、対象コミット `c8d3f7f` を比較して改訂してください。まずR1/R2の反例を説明し、定足数署名だけでは現行の安全性が成立しない点を認めるか、再現可能な反証を示してください。テスト名やAI同士の同意を証明に使わないでください。
 >
-> 現行の通常デーモン、同一プロセステスト、TUI、実Linux執行、将来構想を区別してください。Linuxビルド失敗・プロセス別CA・未commit成功・執行失敗無視・map容量・SSH例外を、根拠行と受入条件へ結び付けてください。
+> 当時の通常デーモン、同一プロセステスト、TUI、実Linux執行、将来構想を区別してください。Linuxビルド失敗・プロセス別CA・未commit成功・執行失敗無視・map容量・SSH例外を、根拠行と受入条件へ結び付けてください。
 >
 > 導入先は未決定です。直送Linux、L4 LB、CDN/L7 proxy、共有siteで何が成立するかを分けてください。まず既存WAF/nftablesで十分か評価し、独自実装の価値がある場合だけ最小profileを提案してください。
 >
@@ -366,36 +368,36 @@ local bypassはサービス再起動やReconcilerで勝手に再有効化され�
 
 ---
 
-## 12. Argon High による設計補正と R1〜R11 確定実装仕様（Mediumモデル引き継ぎ用）
+## 12. 当時の追補設計候補と未解決事項
 
-GPT-6 Astra / ultra による上記レビュー（R1〜R11）と実機検証（`pi-node` での `BPF_PROG_TEST_RUN` および `2026-10-23-reproduction-cases.rs` の反例8件）はすべて妥当であり、全面的に採用する。その上で、レビュー文書内で抽象的に残されていた箇所および運用上のエッジケース3点を以下の通り補正し、次フェーズ（Mediumモデルでの実装）が迷わず実装できる確定仕様とする。
+この追補には、具体化された構造体・チェックリストの案が残っていますが、レビューの全面採用や安全性の確定を意味しません。特にR2のview変更・unlock・永続化の完全性と、時刻不確実時のfallbackは未解決です。モデル名やレビューへの同意を根拠に仕様確定と扱っていた表現を訂正します。実装・本番導入・研究再開の承認ではありません。
 
-### 12.1 GPT-6 Astra 設計案に対する3点の補正
+### 12.1 当時追加された3点と制約
 
-1. **第7節（BFT状態遷移の具体化 — R1・R2の完全閉鎖仕様）**:
-   - 第7節では「独自プロトコルの完成仕様ではない」として状態遷移が抽象化されていたが、実装フェーズで齟齬が生じないよう、以下の通り **Hash-Chained Log + 2-Phase Locked BFT (`PrepareQC` / `CommitQC` / `NewView`)** の構造体と状態遷移規則を確定する。
-   - **R1対策（Prefix Hash Chain）**: `LogEntry` に `parent_hash: [u8; 32]` を追加する。`index = 1` の `parent_hash` は `[0u8; 32]`（または `cluster_config_digest`）、`index > 1` の `parent_hash` は直前エントリ `log[index - 2].digest()` とする。`LogEntry::digest()` は `(cluster_id, config_epoch, term, index, parent_hash, command)` を SHA-256 でハッシュ化する。これにより末尾のQC（例：`index = 2` の `NoOp`）の `entry_hash` が `index = 1` の内容に暗号学的に束縛され、`audit_tail_qc_commits_conflicting_prefixes` は数学的に成立しなくなる。
+1. **第7節へのBFT状態遷移案（完全性未確認）**:
+   - 第7節では「独自プロトコルの完成仕様ではない」として状態遷移が抽象化されていたが、実装フェーズで齟齬が生じないよう、以下の **Hash-Chained Log + 2-Phase Locked BFT (`PrepareQC` / `CommitQC` / `NewView`)** が候補として挙げられた。構造体だけで完全なsafe-vote・unlock・view同期・復旧契約は確定しない。
+   - **R1対策（Prefix Hash Chain）**: `LogEntry` に `parent_hash: [u8; 32]` を追加する。`index = 1` の `parent_hash` は `[0u8; 32]`（または `cluster_config_digest`）、`index > 1` の `parent_hash` は直前エントリ `log[index - 2].digest()` とする。`LogEntry::digest()` は `(cluster_id, config_epoch, term, index, parent_hash, command)` を SHA-256 でハッシュ化する。意図は末尾QCのhashへprefixを束縛すること。canonical化・検証範囲・全状態遷移を含む保証は別に確認が必要であり、「数学的に欠陥が完全に消える」とは結論しない。
    - **R2対策（同一スロット二重投票禁止 ＋ 2段階QCロック `locked_qc`）**:
      - **二重署名防止**: `ConsensusState`（および永続WAL）に `voted_slots: BTreeMap<(u64, u64, VotePhase), [u8; 32]>` を保持する。まず `AppendEntries` 内の各エントリについて `entry.term != current_term`（過去のtermの混ぜ込み）を拒否し、`audit_term_sandwich_obtains_two_votes_for_same_term_and_index` を防ぐ。さらに同一 `(term, index, phase)` に対して一度署名した `entry_hash` と異なるハッシュへの署名を恒久的に拒否する。
      - **2段階QC（`VotePhase::Prepare` → `VotePhase::Commit`）**:
        1. リーダーがエントリを複製すると、フォロワーは `locked_qc` と競合しないことを検証した上で `VotePhase::Prepare` 署名を返す。
        2. リーダーが $2f+1 = 3$ 票の `Prepare` 署名を集めて `PrepareQC` を形成しフォロワーへ送ると、各フォロワーは **`self.locked_qc = Some(prepare_qc)` を更新・永続化**した上で、`VotePhase::Commit` 署名を返す。
        3. リーダーが $2f+1 = 3$ 票の `Commit` 署名を集めて `CommitQC` を形成した時点で初めて `commit_index` が進み、カーネルへ適用される。
-       4. これにより、任意の1台（Node B）が `CommitQC(X)` を受け取って `X` を確定した時点では、必ず $2f+1 = 3$ 台（うち誠実ノード最低2台：Node B, C）が `PrepareQC(X)` を受け取って `locked_qc = X` にロック済みとなる。次の `term = 2` で競合値 `Y` を提案しても、C は `locked_qc = X` により投票を拒否するため、定足数（3票）が絶対に集まらず `audit_hidden_qc_allows_conflicting_commits_across_terms` が完全に防がれる。
+       4. この例はlockを保持する理由を説明する候補であり、一般的なBFT安全性の証明ではない。unlock・new-view・遅延QC・再起動を含む規則と検証が未完のため、「3票が絶対に集まらない」「反例を完全に防ぐ」とは主張しない。
 2. **第6.4節（NTP障害・時刻不確実時のフォールバック補正）**:
-   - 壁時計の `issued_at` / `not_after` で古い決定の再適用を防ぐ設計は採用するが、UDP/123（NTP）へのDDoS等で時刻誤差上限が確認できない場合に「全自動遮断を完全停止」すると防衛機構自体が無력化される。そのため、**「現在進行中の合意viewで新規に承認された決定については、設定された最大短期リース上限（例：`max_fallback_ttl_secs = 300`）で `CLOCK_BOOTTIME` にクランプして適用を許可し、再起動後のWAL/Snapshot復元や遅延catch-upによる過去決定の再適用時のみ壁時計検査を厳格に要求する」** 二段構えとする。
+   - 当時は、時計の誤差上限が不明でも新しいviewの決定に短期TTL（例300秒）を与えるfallbackが提案された。しかし、新しいviewにいることだけでは決定の実時間の鮮度を証明できず、元の署名期限を守る条件にもならない。第6.4節の期限を延長しない契約と同等だという主張は撤回する。採用済みの安全なfallbackや現行製品の運用手順として案内しない。
 3. **再現テストコードのポータビリティ補正**:
-   - [`docs/review/2026-10-23-reproduction-cases.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/docs/review/2026-10-23-reproduction-cases.rs#L378-L398) の `transport_review_existing_key_permissions_are_not_validated` が特定の `/tmp/veil-mesh-transport-review.etzQSI` パスをハードコードしていたため、`std::env::temp_dir()` 配下にプロセスID付き一意ディレクトリを生成・掃除する形に補正済み。
+   - [`docs/review/2026-10-23-reproduction-cases.rs`](review/2026-10-23-reproduction-cases.rs#L378) の `transport_review_existing_key_permissions_are_not_validated` が特定の `/tmp/veil-mesh-transport-review.etzQSI` パスをハードコードしていたため、`std::env::temp_dir()` 配下にプロセスID付き一意ディレクトリを生成・掃除する形に補正済み。
 
-### 12.2 R1〜R11 ファイル別実装チェックリスト（実装フェーズ用）
+### 12.2 当時の実装候補チェックリスト（達成一覧ではない）
 
-| 項目 | 対象ファイル | 実装内容 |
+| 項目 | 対象ファイル | 当時の候補・要求（達成を意味しない） |
 | --- | --- | --- |
-| **R1 / R2 / R10** | [`veil-node/src/domain/entities.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/domain/entities.rs), [`veil-node/src/usecase/consensus_engine.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/usecase/consensus_engine.rs) | `LogEntry` に `parent_hash: [u8; 32]` 追加。`VotePhase::{Prepare, Commit}` の2段階QC、`locked_qc`、`voted_slots` の導入。`entry.term < current_term` の拒否。`current_term + 1 >= MAX_SAFE_TERM` 到達時は選挙を開始せずエラー/停止状態にする |
-| **R3** | [`veil-node/src/infra/quic_mtls.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/infra/quic_mtls.rs), [`veil-node/src/main.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/main.rs) | ファイルベースの共有CA / Node証明書 / 静的Peer公開鍵束（`ClusterConfig`）の読み込み経路を追加し、独立OSプロセス間でmTLSハンドシェイクと合意ラウンドが成立するようにする |
-| **R4** | [`veil-node/src/infra/quic_mtls.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/infra/quic_mtls.rs), [`veil-node/src/usecase/consensus_engine.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/usecase/consensus_engine.rs) | `propose_and_commit` は `PrepareQC` → `CommitQC` の2往復後に `commit_index >= idx && last_applied >= idx` を確認できなかった場合 `Err` を返す。`apply_committed` は `bridge.sync_peer_policy` が `Err` を返した際に `last_applied` やインメモリ遮断状態を更新せず、`last_apply_error` を記録する |
-| **R5** | [`veil-node/src/proof_tests.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/proof_tests.rs#L424) | Linux専用 `proof_7` の `ebpf_bridge::AyaKernelBridge` を `crate::ebpf_bridge::AyaKernelBridge` に修正。前提インターフェース不在時はテスト成功と混同しないよう明示ログ・環境変数制御を設ける |
-| **R6 / R7** | [`veil-ebpf/src/veil_xdp_kern.c`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-ebpf/src/veil_xdp_kern.c), [`veil-ebpf/src/main.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-ebpf/src/main.rs), [`veil-node/src/usecase/ports.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/usecase/ports.rs), [`veil-node/src/ebpf_bridge.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/ebpf_bridge.rs) | C版XDPの `src_port == 22 \|\| src_port == 10023` バイパスを削除し、Rust版と挙動を統一。`PEER_POLICY_MAP` の上限拡張と、信頼回復（解除）時の `remove_peer_policy`（map要素削除）を追加して257件目以降の枯渇を防ぐ |
-| **R8** | [`veil-node/src/adapter/crypto_ring.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/adapter/crypto_ring.rs) | 既存鍵読み込み時に Unix mode が `0600` 以外（例：`0644`）またはシンボリックリンクであれば `Err` で拒否する。新規作成時は `OpenOptionsExt::mode(0o600)` と `create_new(true)` で最初から `0600` として排他作成する |
-| **R9** | [`veil-node/src/usecase/consensus_engine.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/usecase/consensus_engine.rs) | `make_append_entries` で未送信ログを切り出す際、`MAX_LOG_ENTRIES_PER_RPC`（1024件）およびワイヤサイズ上限以下にチャンク分割して送信する |
-| **回帰テスト** | [`veil-node/src/proof_tests.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/veil-node/src/proof_tests.rs) | [`docs/review/2026-10-23-reproduction-cases.rs`](file:///Users/takemuramasaki/_workspace/veil-mesh-consensus/docs/review/2026-10-23-reproduction-cases.rs) の全8件（Linux実機では9件）を「欠陥が阻止されること（不変条件の成立）」をアサートする回帰テストとして `proof_tests.rs` に組み込む |
+| **R1 / R2 / R10** | [`veil-node/src/domain/entities.rs`](../veil-node/src/domain/entities.rs), [`veil-node/src/usecase/consensus_engine.rs`](../veil-node/src/usecase/consensus_engine.rs) | `LogEntry` に `parent_hash: [u8; 32]` 追加。`VotePhase::{Prepare, Commit}` の2段階QC、`locked_qc`、`voted_slots` の導入。`entry.term < current_term` の拒否。`current_term + 1 >= MAX_SAFE_TERM` 到達時は選挙を開始せずエラー/停止状態にする |
+| **R3** | [`veil-node/src/infra/quic_mtls.rs`](../veil-node/src/infra/quic_mtls.rs), [`veil-node/src/main.rs`](../veil-node/src/main.rs) | ファイルベースの共有CA / Node証明書 / 静的Peer公開鍵束（`ClusterConfig`）の読み込み経路を追加し、独立OSプロセス間でmTLSハンドシェイクと合意ラウンドが成立するようにする |
+| **R4** | [`veil-node/src/infra/quic_mtls.rs`](../veil-node/src/infra/quic_mtls.rs), [`veil-node/src/usecase/consensus_engine.rs`](../veil-node/src/usecase/consensus_engine.rs) | `propose_and_commit` は `PrepareQC` → `CommitQC` の2往復後に `commit_index >= idx && last_applied >= idx` を確認できなかった場合 `Err` を返す。`apply_committed` は `bridge.sync_peer_policy` が `Err` を返した際に `last_applied` やインメモリ遮断状態を更新せず、`last_apply_error` を記録する |
+| **R5** | [`veil-node/src/proof_tests.rs`](../veil-node/src/proof_tests.rs#L424) | Linux専用 `proof_7` の `ebpf_bridge::AyaKernelBridge` を `crate::ebpf_bridge::AyaKernelBridge` に修正。前提インターフェース不在時はテスト成功と混同しないよう明示ログ・環境変数制御を設ける |
+| **R6 / R7** | [`veil-ebpf/src/veil_xdp_kern.c`](../veil-ebpf/src/veil_xdp_kern.c), [`veil-ebpf/src/main.rs`](../veil-ebpf/src/main.rs), [`veil-node/src/usecase/ports.rs`](../veil-node/src/usecase/ports.rs), [`veil-node/src/ebpf_bridge.rs`](../veil-node/src/ebpf_bridge.rs) | C版XDPの `src_port == 22 \|\| src_port == 10023` バイパスを削除し、Rust版と挙動を統一。`PEER_POLICY_MAP` の上限拡張と、信頼回復（解除）時の `remove_peer_policy`（map要素削除）を追加して257件目以降の枯渇を防ぐ |
+| **R8** | [`veil-node/src/adapter/crypto_ring.rs`](../veil-node/src/adapter/crypto_ring.rs) | 既存鍵読み込み時に Unix mode が `0600` 以外（例：`0644`）またはシンボリックリンクであれば `Err` で拒否する。新規作成時は `OpenOptionsExt::mode(0o600)` と `create_new(true)` で最初から `0600` として排他作成する |
+| **R9** | [`veil-node/src/usecase/consensus_engine.rs`](../veil-node/src/usecase/consensus_engine.rs) | `make_append_entries` で未送信ログを切り出す際、`MAX_LOG_ENTRIES_PER_RPC`（1024件）およびワイヤサイズ上限以下にチャンク分割して送信する |
+| **回帰テスト** | [`veil-node/src/proof_tests.rs`](../veil-node/src/proof_tests.rs) | [`docs/review/2026-10-23-reproduction-cases.rs`](review/2026-10-23-reproduction-cases.rs) の全8件（Linux実機では9件）を「欠陥が阻止されること（不変条件の成立）」をアサートする回帰テストとして `proof_tests.rs` に組み込む |

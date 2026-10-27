@@ -13,7 +13,7 @@
 
 This is not a claim that all software requiring sudo is inappropriate or that GCP and AWS prohibit eBPF in general. The decision concerns this project's goal, implementation, deployment burden, and demonstrated benefits.
 
-Code, history, existing uncommitted work, and local trial evidence are preserved. The GitHub code is not identical to later local changes and trial records. **The installation instructions, designs, and roadmaps below are historical experiment records, not current deployment recommendations or plans to resume development.**
+Code, history, existing uncommitted work, and local trial evidence are preserved. The GitHub code is not identical to later local changes and trial records. **The instructions, designs, and roadmaps are historical records. See the [validation status and public-code evidence](docs/VALIDATION_STATUS.md) (Japanese) for implemented, simulated, unverified and unmet scopes. They are not deployment recommendations or plans to resume development.**
 
 ---
 
@@ -23,72 +23,72 @@ Code, history, existing uncommitted work, and local trial evidence are preserved
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/mt4110/veil-mesh-consensus)](https://github.com/mt4110/veil-mesh-consensus/releases)
 
-[日本語 (Main)](README.md) · [🧭 v0.9.1 Architecture & Roadmap](docs/V1_ARCHITECTURE_AND_ROADMAP.md) · [📋 Feasibility Review & Design](docs/FEASIBILITY_REVIEW_AND_V1_DESIGN.md) · [☁️ Historical Cloud/Edge Proposals (Deployment and Integration Unverified)](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 Proof Documentation](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
+CI badges and release numbers are historical entry points; they do not establish a real-kernel run or production acceptance.
 
-**An experimental prototype that synchronizes block rules decided by signed Raft-based consensus (Ed25519 `SignedConsensusRpc` + Multi-Signature `QuorumCertificate` over mTLS QUIC) into Linux kernel eBPF (`Aya` XDP packet filtering) and a user-space LSM simulation bridge.**
+[日本語 (Main)](README.md) · [🧭 Historical Design & Ended Roadmap](docs/V1_ARCHITECTURE_AND_ROADMAP.md) · [📋 Historical Review & Incomplete Proposals](docs/FEASIBILITY_REVIEW_AND_V1_DESIGN.md) · [☁️ Historical Cloud/Edge Proposals (Deployment and Integration Unverified)](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 Scenario Tests & Limitations](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
 
-![Autonomous Attack Extermination Flow](./assets/extermination-flow.svg)
+An experimental prototype containing a signed consensus state machine, mTLS QUIC, IPv4 XDP and a TUI. Component implementations and scenario tests do not establish an operational defense mesh that tolerates compromised servers.
+
+![Historical TUI experiment diagram; not a defense or zero-leakage guarantee](./assets/extermination-flow.svg)
 
 ---
 
-## 🎬 Live Hardware Demo (`iftop` Bandwidth Monitor & Real Kernel XDP + TUI Arena)
+## 🎬 Historical Isolated-veth and TUI Demo
 
 <!-- rgc:start -->
-![Demo](./assets/demo.gif)
+![Historical isolated-veth and single-process TUI demo](./assets/demo.gif)
 <!-- rgc:end -->
 
-> **🎥 What Happens in the Demo GIF (`[a]` $\to$ `[b]` $\to$ `[x]` Key Sequence)**
->
-> - **Left Terminal (`sudo iftop -i veth-victim`)**: Real-time network bandwidth monitor on a physical Linux host (`pi-node`: Kernel 7.0 x86_64).
-> - **Right Terminal (`veil-node --tui`)**: TUI Arena with live eBPF bytecode (`veil_xdp_kern.o`) attached to the kernel `veth-victim` interface.
->
-> 1. **Press `[a]` (Spawn Rogue Attack Process)**: Spawns an OS process inside `ns-veil-rogue` (`10.99.0.66`) sending a 1,000 pkt/s UDP flood at `10.99.0.1:9999`.
-> 2. **Press `[b]` (Inject Byzantine Forged RPC)**: Broadcasts a forged `AppendEntries` RPC spoofing `node-alpha` (`Term 999`). Nodes verify and reject the packet via **Ed25519 public key verification**.
-> 3. **Press `[x]` (Consensus Commit & Kernel eBPF Sync)**: Once the 4-node cluster reaches a multi-signature Quorum ($\ge 3/4$ Ed25519 QC signatures), `sys_bpf(BPF_MAP_UPDATE_ELEM)` writes `trusted=0` into the kernel `PEER_POLICY_MAP`, triggering **NIC-level `XDP_DROP`**, **user-space LSM / Stealth GC simulation**, and **`sys_kill(PID, SIGKILL=9)`** to stop the mock attack process.
+The TUI uses four state machines and demo keys in one process. This is not evidence of four independent hosts, automatic attack detection, production acceptance or general BFT safety.
+
+- `[a]` starts a test-owned process: UDP generation in the dedicated Linux namespace, otherwise `sleep`. A roughly 1 ms wait is a program setting, not a measured 1,000 pkt/s rate.
+- `[b]` injects a forged RPC into the state machines. It does not establish real-world attack detection.
+- `[x]` drives the in-process consensus demonstration, bridge updates where connected, dummy-buffer clearing and termination of a test-owned process. Actual kernel effects must be checked independently. No application-secret erasure or host-wide protection was demonstrated.
 
 ---
 
-## 🛡️ Security Model: Verified Protections & Known Limitations
+## 🛡️ Implementation, Test Scope and Unmet Conditions
 
-This project is an **experimental prototype exploring consensus-driven eBPF policy enforcement**. Below is an honest breakdown of what is cryptographically enforced and tested in code (`proof_1`–`proof_11`), alongside current limitations.
+See the [public-code validation status](docs/VALIDATION_STATUS.md) and [scenario-test guide](docs/CONSENSUS_AND_EBPF_PROOF.md) (Japanese). `proof_*` names do not constitute mathematical proofs of BFT safety.
 
-### 1. Verified Protections in Code (`proof_1`–`proof_14` + `regression_r1`–`r10`)
+| Area | Present in public code | Limit |
+| --- | --- | --- |
+| Signatures, QC, prefix hashes | Validation functions and selected regression cases | No general BFT, input-truth or false-positive guarantee |
+| mTLS, shared PKI, WAL | Read/write paths and scenario tests | Secure key distribution, durability before every response and independent-host operation remain unaccepted |
+| View-Change | TimeoutVote/TC state-machine functions and explicitly driven tests | No completed automatic timeout/censorship runtime or complete two-phase-QC BFT |
+| TTL, emergency bypass, metrics | User-space functions and tests | No kernel expiry guarantee, kernel bypass operation, recovery CLI or HTTP exporter |
+| XDP | Exact source-IPv4 HASH map; historical isolated-veth evidence | No IPv6/CIDR, kernel TTL, all-NIC support or rebuilt-object/source identity guarantee |
+| LSM and secret clearing | Rust hook, optional attachment path and dummy-buffer clearing | No demonstrated application-secret erasure, PHP/host protection or zero leakage |
+| Guardrails | Exact IPv4 and selected bounds checks | No automatic protection of all management networks, peers or gateways |
 
-| Threat Scenario | Enforcement Status | Implementation & Regression Proof |
-| :--- | :---: | :--- |
-| **Unsigned, spoofed, or tampered RPCs on the QUIC wire** | **Enforced & Tested** | `WireMessage::Consensus` exclusively carries `SignedConsensusRpc`, and [`handle_connection`](veil-node/src/infra/quic_mtls.rs) always validates messages via [`handle_signed_rpc`](veil-node/src/usecase/consensus_engine.rs) (`proof_5`, `proof_9`). |
-| **Untrusted TLS peers & Multi-Process Shared Root CA** | **Enforced & Tested** | [`ClusterMtlsPki`](veil-node/src/infra/quic_mtls.rs) enforces mutual TLS 1.3 and supports shared multi-process PKI, peer public key auto-discovery, and Crash-Recovery WAL (`proof_9`, `regression_r3`, `regression_wal`). |
-| **Prefix tampering via tail QC (R1) & Cross-term conflicting commits (R2)** | **Enforced & Tested** | Cumulative hash chaining ([`digest_with_parent`](veil-node/src/domain/entities.rs)), Voted-Entry Locks, and double-vote prevention (`voted_entry_hashes`) prevent conflicting commits (`proof_8`, `regression_r1`, `regression_r2`). |
-| **Silent/censoring leader stalls (View-Change)** | **Enforced & Tested** | $\lfloor 2N/3 \rfloor + 1$ `TimeoutVote`s form a [`TimeoutCertificate`](veil-node/src/domain/entities.rs) (TC) to deterministically rotate to the next round-robin leader (`proof_12`, `proof_14`). |
-| **Relative TTL auto-expiry, micro-batching & emergency local bypass** | **Enforced & Tested** | Monotonic-clock TTL auto-expiry, `SetPeerTrustBatch` (up to 128 rules), emergency local bypass, and Prometheus metrics are implemented and verified (`proof_13`). |
-| **Boundary attacks (`index = 0` / `term >= MAX_SAFE_TERM`), `0600` key perms & chunking** | **Enforced & Tested** | Pre-validation rejects out-of-bounds indices/terms, enforces `0600` key permissions, and chunks catch-up batches (`proof_11`, `regression_r8`, `regression_r9`, `regression_r10`). |
+Root-compromised hosts, quorum-key compromise and upstream bandwidth saturation remain outside protection. Source spoofing, NAT and shared proxies can cause incorrect blocking. Consensus cannot make a detector's input true.
 
-### 2. Known Limitations & Out-of-Scope Risks
-
-- **Real Kernel XDP vs. Simulated User-Space LSM/Stealth GC**: The IPv4 `XDP_DROP` packet filter (`veil_xdp_kern.c` / `PEER_POLICY_MAP`) is tested on a live Linux kernel (`proof_7`), whereas the LSM `socket_connect` lockdown and Stealth GC key zeroization are currently simulated in user space via `MockEbpfBridge`.
-- **IPv4-Only XDP & Source IP Spoofing**: The current XDP program inspects IPv4 source addresses (`src_ip`) only (IPv6 passes through). Because L3 source IPs can be spoofed in raw UDP packets, production deployments should feed consensus proposals from authenticated L7 WAF or TCP-established host sensors ([`veil-warden`](https://github.com/mt4110/veil-warden)) rather than unverified UDP source IPs.
-- **Shared Credentials & Host Root Compromise**: Consensus cannot prevent data exfiltration inside a node where `root` is already compromised, nor can it survive simultaneous compromise of $\ge 2f+1$ nodes sharing identical admin credentials.
+Warden, Blackhole, veil-rs, Arena, WAF and Nginx integrations were historical ideas; an accepted end-to-end detection→consensus→enforcement→audit integration was not confirmed. Another project's evidence is not evidence for this mesh.
 
 ---
 
-## 🧪 11 Verification & Regression Proof Tests
+## 🧪 Scenario Tests and Historical Check Scripts
+
+`proof_1`–`proof_14` and regression cases cover different scopes: state machines, loopback QUIC in one process, mocks and a conditional Linux-veth test. They do not establish general safety.
 
 ```bash
-# Run Markdown lint, ShellCheck, Clippy, and all proof tests
+# Historical development checks; inspect skipped and conditional checks separately
 bash scripts/check.sh
 
-# Run all proof tests including live Linux kernel XDP_DROP on pi-node
+# Dedicated historical host only; can change remote network and tracing state
 bash scripts/deploy-pi-node.sh test
 
-# Save verification evidence in veil-arena format
+# Saves cargo output and a fixed-format summary
 bash scripts/arena-smoke.sh
 ```
+
+`proof_7` returns `Ok(())` when prerequisites are missing or attachment fails. Green CI or the smoke script's PASS summary does not establish a real-kernel run. `check.sh` omits ShellCheck when it cannot find it. This documentation audit did not rerun product or live-kernel tests. Nix MicroVM configurations and old commands likewise do not establish a working two-VM defense mesh.
 
 ---
 
 ## ☁️ Cloud & Edge Deployment Matrix (AWS / GCP / Azure / Cloudflare / Vercel)
 
-The table describes validation of this implementation. Provider XDP capability alone does not establish successful deployment. See the [public AWS/GCP trial summary](docs/review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md) (Japanese). The [historical deployment guide](docs/CLOUD_DEPLOYMENT_GUIDE.md) describes proposed configurations, not validated deployment procedures.
+The AWS/GCP measurements below concern a later local `veil-local-ban` implementation, not the public main defense mesh. Provider XDP capability alone does not establish successful deployment. See the [public AWS/GCP trial summary](docs/review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md) (Japanese). The [historical deployment guide](docs/CLOUD_DEPLOYMENT_GUIDE.md) describes proposed configurations, not validated deployment procedures.
 
 | Platform | Deployment / integration validation | Trial result / historical proposal | Historical guide |
 | :--- | :---: | :--- | :--- |

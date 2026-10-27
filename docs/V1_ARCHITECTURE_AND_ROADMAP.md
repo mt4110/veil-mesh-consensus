@@ -1,206 +1,73 @@
-# 🧭 `veil-mesh-consensus` v0.9.1 実践アーキテクチャ設計書 & 運用ロードマップ
+# 旧アーキテクチャ案と未達事項（終了したロードマップ）
 
-[README（日本語）](../README.md) · [English README](../README_EN.md) · [検証テスト解説書](CONSENSUS_AND_EBPF_PROOF.md) · [クラウド導入ガイド](CLOUD_DEPLOYMENT_GUIDE.md)
+[README](../README.md) · [確認状況・コード根拠](VALIDATION_STATUS.md) · [旧版レビューと改訂案](FEASIBILITY_REVIEW_AND_V1_DESIGN.md) · [シナリオ試験](CONSENSUS_AND_EBPF_PROOF.md) · [過去のクラウド構成案](CLOUD_DEPLOYMENT_GUIDE.md)
 
-本書は、`veil-mesh-consensus` を実験的プロトタイプ（`v0.3.0`）から、現場の Web / API / PHP アプリケーション基盤の水際防衛で確実な運用実績を出せる実戦パイロット品質（`v0.9.1`）へ引き上げるための技術仕様書です。
+2026-10-27訂正。開発終了・本番導入非推奨。本書はかつて目指した設計と公開実装との差を記録するもので、運用保証や開発再開計画ではありません。旧題の「v0.9.1 実践設計書」と完了表記は、その設計全体の達成を意味しません。
 
-抽象的なスローガンや「100%・完全」といった誇張表現を排し、**① 前提条件と保証の境界、② 合意プロトコルの安全性と View-Change 仕様、③ カーネル eBPF (`LPM_TRIE` + 単調増加クロック TTL) のデータ構造、④ 障害復旧（WAL `fsync`）と輻輳制御、⑤ 実運用での SLI/SLO と Runbook** を定義します。
+## 1. 当初の目的と終了判断
 
----
+1台が侵害されても、他の健全なサーバーに不当な遮断を波及させない分散防御を目指しました。署名付き状態機械・QUIC・XDPの部品と限定シナリオは試作しましたが、運用としての成立と導入負担に見合う価値は確認できませんでした。
 
-## 1. 設計の核心：なぜ「ブロックチェーン型 BFT」ではなく「実用防衛メッシュ」なのか
+後続の単体ホスト用ローカルBANの隔離・特定hostの成功は、分散防御の達成ではありません。元の用途に対する実測比較がなく、PHP-FPM／DB枯渇の「根本防止」やFail2banに対する優位性を主張しません。
 
-分散合意をインフラ防衛に適用する際、パブリック・ブロックチェーン（見知らぬ敵対組織間で資産台帳を合意する Tendermint 等）の設計をそのまま持ち込むと、導入・運用コストが破綻します。本設計では、現場の運用実態に合わせて以下の選択を行います。
+## 2. 旧設計で目指した条件と実際の確認状況
 
-| 設計軸 | ✕ ブロックチェーン偏重の非現実的な設計（不採用） | ◎ 本設計（実戦・運用ファーストの Clean Architecture） |
-| :--- | :--- | :--- |
-| **運用主体と構成管理** | 複数の別組織・別担当者が `k-of-m` オフライン署名でノード追加を承認する | **同一のインフラチーム（または1人の管理者）** が管理する $N=4$（または $N=7$）台のサーバー群。Ansible / NixOS / Terraform で配布できる静的な `cluster.toml` 1ファイルで完結させる |
-| **合意エンジンの依存** | 外部の巨大なブロックチェーン用エンジン（`Malachite` / Tendermint 等）を組み込み、空ブロックや Mempool を常時回す | 外部ブロックチェーンライブラリには依存せず、UseCase 層の [`ConsensusState`](../veil-node/src/usecase/consensus_engine.rs) に **2段階 QC（Prepare / Commit）と `TimeoutCertificate`（約200行）** を実装し、サプライチェーン攻撃面を最小化する |
-| **ハードウェア要件** | TPM Quote / Confidential VM Attestation / 異種クラウド・異種 CPU 混在を要求する | 標準的な Linux VM（Kernel 6.1+、AWS EC2 / GCP / Azure / VPS / ベアメタル）と **`0600` パーミッションの CSPRNG 鍵ファイルのみ** で動作する |
-| **時刻同期（NTP ズレ）への耐性** | 壁時計（Wall-clock UNIX 時刻）を合意ペイロードに入れてしまい、NTP ズレでハッシュ不一致を起こす | 合意ログには **相対秒数 (`ttl_secs: u32`)** のみを記録し、各ノードがコミット適用時にカーネルの単調増加クロック (`bpf_ktime_get_boot_ns()`) の期限値へ変換する |
-| **責務の分離（Unix 哲学）** | 1つのバイナリに XDP、BPF LSM、シークレット検査をすべて密結合させる | - **合意形成 & XDP 水際遮断**: `veil-mesh-consensus`<br>- **ホスト内プロセス & BPF LSM 制御**: [`veil-warden`](https://github.com/mt4110/veil-warden)<br>- **監査ログの秘密情報マスキング**: [`veil-rs`](https://github.com/mt4110/veil-rs)<br>- **分断・障害再現テスト**: [`veil-arena`](https://github.com/mt4110/veil-arena) |
+| 旧設計の目標 | 公開実装・記録で確認できる範囲 | 未達・制約 |
+| --- | --- | --- |
+| 4または7 validator、固定 `cluster.toml` | peerリスト・署名鍵登録・共有ディレクトリの読込みがある | 旧案どおりの固定構成配布・TLS identity・独立host運用の受入れは未達 |
+| Prepare／Commitの2段階QCと安全なview変更 | 単一の `QuorumCertificate`、投票lock、TimeoutVote／TCがある | phaseごとに分離した完成BFTではない。一般的な安全性・進行性を証明していない |
+| S1：全viewで確定値が一意 | 選択したprefix／競合caseの回帰テストがある | 任意の配送・侵害・復旧を通じた保証は未確認 |
+| S2：正しい権限・定足数でのみ執行 | QC・署名検査がある | 正常署名の誤検知を防がない。実kernelの執行成否は別に確認が必要 |
+| S3：管理経路・CIDRの自己遮断防止 | exact IPv4の保護集合と一部境界検査がある | 全loopback・管理網・peer・gatewayの自動保護、CIDR交差検査はない |
+| S4：daemon停止中もkernelで期限切れ | ユーザー空間の相対TTLと明示時計の試験がある | 公開XDPのABIに期限がなく、この条件を満たさない |
+| L1：沈黙／検閲から自動回復 | timeoutを試験から明示的に呼ぶTCの状態遷移がある | 通常daemonのtimer・提案共有・独立hostの検閲回復は未達 |
+| IPv4／IPv6のLPM_TRIE | exact IPv4 HASH、ソース上限4096 | IPv6／CIDR／LPMの完成機能ではない。旧案の65536件は実装容量ではない |
+| 50ms集約・重複排除・自動容量管理 | 最大128件のbatchコマンドがある | 時間窓入力集約、sensor socket、未失効ルールの安全な回収、負荷性能は別の未達事項 |
+| Prometheus HTTP exporter | metrics文字列を生成する関数がある | `127.0.0.1:9100/metrics` や旧案の全SLIを配信していない |
+| `veil-node ctl unban`／`emergency-detach` | ユーザー空間のbypass flagがある | 旧CLIは未実装。flagだけで実kernelの遮断は解除されない |
 
----
+型と通常daemonは[entities](../veil-node/src/domain/entities.rs)・[main](../veil-node/src/main.rs)、kernel ABIは[PeerPolicy](../veil-common/src/lib.rs)・[C版XDP](../veil-ebpf/src/veil_xdp_kern.c)、各処理は[状態機械](../veil-node/src/usecase/consensus_engine.rs)を参照してください。
 
-## 2. 保証（Guarantees）・前提条件（Assumptions）・対象外リスク（Out-of-Scope）
+## 3. BFT・永続化・期限に関する設計上の注意
 
-すべての主張を **【保証 ＋ 前提条件 ＋ 検証手段 ＋ 対象外】** の4点セットで定義します。前提条件が崩れた場合、該当する保証は成立しません。
+N=4、必要署名q=3なら、2つのquorumの交差は最低 `3 + 3 - 4 = 2` 台です。悪意あるnodeが最大1台なら少なくとも1台は誠実ですが、この算術だけでは、そのnodeが全phase・view・再起動で矛盾署名を拒否することは証明できません。safe-vote、lock／unlock、新view、鮮度、永続化の契約が別に必要です。
 
-### 2.1 システムが提供する保証（S1〜S4, L1）
+[HotStuff-2著者解説](https://decentralizedthoughts.github.io/2023-04-01-hotstuff-2/)は方式比較の参考です。本作がその完全な状態遷移を実装・検証したという意味ではありません。「約200行でBFT完成」「定足数交差により本実装の安全性を証明」という旧主張は撤回します。
 
-| ID | 保証の定義（何が起きないか / 何が起きるか） | 成り立つための前提条件 | 検証手段 |
-| :---: | :--- | :--- | :--- |
-| **S1: 合意の一貫性**<br>*(Agreement)* | 誠実な2台のノードが、同一の `(term, index)` において異なる遮断ルールバッチを確定（Commit）することはない。 | 故障・侵害されたノード数が $f < N/3$（$N=4$ なら $f \le 1$）であり、誠実なノードの Ed25519 秘密鍵が漏洩しておらず、再起動時に WAL (`fsync`) が保持されていること。 | `proof_1`, `proof_3`, `proof_8` および `proptest` / モデル検査 |
-| **S2: 定足数の強制**<br>*(Quorum Auth)* | $\lfloor 2N/3 \rfloor + 1$ 台（$N=4$ で3台）の異なるメンバーによる検証済み Ed25519 署名（`CommitQC`）なしに、誠実なノードが遮断ルールを eBPF マップへ適用することはない。 | `cluster.toml` に記載されたメンバー公開鍵リストが改ざんされていないこと。 | `proof_8`, `proof_10`（単独コミット・嘘の `match_index` 拒否） |
-| **S3: 自己窒息の防止**<br>*(Guardrail Policy)* | 保護対象 CIDR（ループバック、クラスタ内ピア IP、管理用 SSH サブネット、デフォルトゲートウェイ）、広すぎるプレフィックス（IPv4 `/0`〜`/23`、IPv6 `/0`〜`/47`）、上限を超える TTL を含む提案に対し、誠実なノードは投票・署名・適用を行わない。 | ドメイン層の [`SecurityPolicyGuard`](../veil-node/src/domain/policy.rs) に保護対象 CIDR が正しく設定されていること。 | `proof_11`（保護 IP ガード検証）およびファジング |
-| **S4: カーネル内期限切れと整合**<br>*(Bounded Enforcement)* | 適用された遮断ルールは TTL 経過後にユーザー空間デーモンが停止していてもカーネル XDP 内で自動的に無効化（`XDP_PASS`）され、デーモン稼働中は `Reconciler` により確定状態と BPF マップの差分が解消される。 | 該当ノードのローカル `root` / `CAP_BPF` が攻撃者に奪われていないこと。 | `proof_7`（実カーネル XDP テスト）および TTL 境界テスト |
-| **L1: リーダー沈黙からの回復**<br>*(View-Change Liveness)* | リーダーが停止、または特定の提案を意図的に無視（検閲）しても、提案タイムアウト後に $2f+1$ 台の `TimeoutVote` から `TimeoutCertificate` (TC) が形成されて `term + 1` の次期リーダーへ交代し、通信遅延が安定した後に合意が進行する。 | ネットワークが部分同期（GST 以降、メッセージ遅延がタイムアウト上限内に収まる）であること。 | `v0.4.0` リーダー `SIGSTOP` / 検閲シミュレート試験 |
+WALは公開版に保存・復元処理がありますが、旧案の「固定256 bytes＋CRCで全必要状態を保持」や「すべての署名応答前にfdatasync」は達成した仕様ではありません。受信時の保存タイミング、checksumと悪意ある改ざんの違い、部分書込み・電源断、投票履歴の巻戻りを区別します。
 
-### 2.2 明確に対象外とするリスク（Out-of-Scope）
+相対TTLを適用時から開始するだけでは、遅延受信・再起動・再適用で期限が延び得ます。ローカル時刻の不確実性を短期TTLへ置き換えるだけで、元の署名期限を保証できるわけでもありません。旧設計のkernel TTLや期限保証を公開版の機能として案内しません。
 
-- **ローカル `root` を奪取されたノード単体の保護**: あるノードで `root` 権限を奪われた場合、攻撃者はそのノード上の XDP プログラムをデタッチしたりデータを持ち出したりできます。本ツールの目的は「侵害された1台のノードから偽の合意メッセージや全解除命令が送られても、**残りの誠実な $N-1$ 台のファイアウォール設定とサービス継続性を守ること**」です。
-- **上流回線を飽和させる Volumetric DDoS**: サーバーの NIC に到達する前の ISP / クラウドゲートウェイの帯域幅を超える攻撃は、ホスト内 XDP では防げません（Cloudflare Magic Transit や AWS Shield 等との併用が必要です）。
-- **未検証の L3 送信元 IP に対する反射型遮断**: 生の UDP パケットの送信元 IP は容易に偽装（Spoofing）できるため、生 UDP 流量のみを根拠に自動提案を行うと、攻撃者が正規ユーザーの IP や DNS サーバーを詐称して遮断させることができます。したがって、遮断提案の入力源は **「TCP ハンドシェイク確立後の L7 WAF / Web サーバーの異常検知」** または **「[`veil-warden`](https://github.com/mt4110/veil-warden) によるホスト内プロセス通信検知」** に限定します。
+LPMの短命な子prefixが期限切れでもmapに残れば、有効な親prefixを隠す設計問題があります。これは[Linux LPM仕様](https://www.kernel.org/doc/html/v6.10/bpf/map_lpm_trie.html)と旧案からの設計上の指摘であり、公開版に存在しないLPM実装の実測障害ではありません。
 
----
+## 4. 撤回する性能・効果の表現
 
-## 3. 実運用ユースケース：どうやって現場（PHP / Web / API サーバー群）で実績を出すか
+| 旧記載 | 訂正 |
+| --- | --- |
+| 合意5〜15ms、同一region p99<25ms | 対象環境・入力・計測結果がない。実測値として撤回。50ms batch待ちを含める遅延のp99<25msという説明も不整合 |
+| 秒間2560 subnetを同期 | `128 / 0.05 = 2560` という算術上限。実装・署名・通信・永続化・適用を含む実効性能ではない |
+| 容量65536、90%で自動eviction | 旧案の値。公開ソースの4096件HASHと異なる。未失効の確定ルールを回収する方針も運用未検証 |
+| 3秒で全復旧 | 復旧CLI・測定結果がない。一般の `ip link ... xdp off` が所有link方式へ適合することも未確認 |
+| PHP負荷ゼロ、根本防止、既存手段に対する決定的優位 | 比較試験なし。CDN／LB経路、共有NAT、誤検知、上流帯域は別問題 |
+| クラウドVMなら鍵ファイルだけで動作 | kernel・driver・NIC・MTU・権限・PKI・runtimeに依存。試したAWS／GCP実NICでは装着失敗、Azure等は未検証 |
 
-例として、ロードバランサ（または DNS ラウンドロビン / Cloudflare）の背後に **4台の Web / PHP アプリケーションサーバー（`web-1` 〜 `web-4`）** がある本番環境を考えます。
+## 5. 外部連携と実運用例
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Attacker as 攻撃者ボット<br/>(203.0.113.55)
-    participant Web1 as web-1 (Leader)<br/>Nginx + PHP-FPM + veil-node
-    participant Web2 as web-2 (Follower)<br/>Nginx + PHP-FPM + veil-node
-    participant Web3 as web-3 (Follower)<br/>Nginx + PHP-FPM + veil-node
-    participant Web4 as web-4 (Follower)<br/>Nginx + PHP-FPM + veil-node
+旧図のWAF／Warden／Blackhole→sensor socket→合意→XDP／LSM→veil-rs／Arenaというpipelineは、動作を確認した構成ではありません。`infra/sensor_socket.rs`、`infra/metrics_prometheus.rs`、`scripts/arena-chaos.sh`、`docs/OPERATIONS_RUNBOOK.md` は公開版の完成成果物として存在しません。
 
-    Attacker->>Web1: TCP 確立後に脆弱性スキャン / wp-login 総当たり / RCE 試行
-    Web1->>Web1: L7 WAF または veil-warden が検知 -> /run/veil-mesh/propose.sock へ通知
-    Web1->>Web1: SecurityPolicyGuard 検査 (保護IPでないか・TTL=3600s) -> 50ms バッチ化
-    par mTLS QUIC による 2段階 QC 合意 (所要 5〜15ms)
-        Web1->>Web2: SignedConsensusRpc(AppendEntries: Block 203.0.113.55/32, TTL=3600s)
-        Web1->>Web3: SignedConsensusRpc(AppendEntries: Block 203.0.113.55/32, TTL=3600s)
-        Web1->>Web4: SignedConsensusRpc(AppendEntries: Block 203.0.113.55/32, TTL=3600s)
-    end
-    Web2-->>Web1: PrepareQC Vote (Ed25519 署名)
-    Web3-->>Web1: PrepareQC Vote (Ed25519 署名 -> 3/4 定足数達成！)
-    Web1->>Web1: CommitQC 生成 -> LPM_TRIE マップ更新 (expires_at = boot_ns + 3600s)
-    Web1->>Web2: CommitQC 配布 -> LPM_TRIE マップ更新
-    Web1->>Web3: CommitQC 配布 -> LPM_TRIE マップ更新
-    Web1->>Web4: CommitQC 配布 -> LPM_TRIE マップ更新
-    Attacker->>Web2: 次の攻撃ターゲットとして web-2 へ SYN パケット送信
-    Note over Web2: NIC ドライバ層 (XDP) で即座に XDP_DROP！<br/>TCP ハンドシェイクも PHP-FPM ワーカー消費もゼロ！
-```
+CloudflareのHTTPヘッダーに元IPがあることと、XDPが処理するpacketのL3送信元が変わることは別です。CDN／L7 proxyを、元IPへの直接接続と同じ図で防御済みと案内しません。4台のWeb／PHP serverの例は構想であり、公開サイトの受入れ記録ではありません。
 
-### なぜこれが現場（特に PHP / 動的 Web 環境）で絶大な効果を出すのか
+## 6. 終了したマイルストーン
 
-1. **PHP-FPM / DB コネクション枯渇の根本防止（集団免疫）**:
-   - PHP-FPM や一般的な Web ワーカーは「プロセス/ワーカー数」に上限があり、1台のサーバーに来た攻撃者が順番に `web-1` $\to$ `web-2` $\to$ `web-3` を叩くと、L7（アプリケーション層）で403を返すだけでもワーカーと CPU が食いつぶされます。
-   - `veil-mesh-consensus` が入っていれば、`web-1` が最初の数リクエストで異常を検知して合意した瞬間（約 5〜15ms 後）、`web-2`〜`web-4` では **Linux カーネルの TCP ソケットすら作らせず、NIC 着信直後の XDP 層でパケットを破棄** します。
-2. **Fail2ban 単体運用との決定的な違い**:
-   - 各サーバーで個別に Fail2ban (`iptables`) を動かすと、「他ノードへの水平展開を防げない」「1台が誤検知したときに自分の監視サーバーやゲートウェイを BAN して孤立する」「侵害されたサーバーで `iptables -F` されたり偽の解除命令を出されたりする」という弱点があります。
-   - 本ツールは **「保護 IP ガードレール (`S3`)」＋「3/4 マルチシグ合意 (`S2`)」＋「XDP 高速破棄 (`S4`)」** によってこれらを解決します。
+| 旧ラベル | 残っている実装・記録 | 旧完了条件の扱い |
+| --- | --- | --- |
+| v0.2.0／v0.3.0 | 層分離、署名・prefix・鍵mode・apply error等の変更とcase | 「全保証完了」「CIがgreenなので実kernel合格」としない |
+| v0.4.0 | TCと明示timeoutの状態機械case | 完成した2段階BFT、fuzzing・独立processの検閲回復まで完了した意味ではない |
+| v0.5.0 | 相対TTL・batch型・bypass flag・metrics文字列 | LPM／IPv6、50ms集約、Unix socket、Warden／Nginx自動遮断の完成ではない |
+| v0.9.1 | 手動RPC配送・明示WAL復元の複合case | 独立hostのnetem・鍵rotation・公開pilotの完成ではない |
 
----
+[CHANGELOG](../CHANGELOG.md)の版番号は当時の変更区分です。2026-10-27に確認した公開Releaseはv0.2.0までであり、v0.9.1のRelease公開を示す表ではありません。旧計画の全完了条件との一致を保証しません。設計・製品開発・追加課金試験は終了しており、この表を次の実装依頼として扱いません。
 
-## 4. 合意プロトコル詳細設計（Raft-BFT Hybrid with 2-Step QC & TimeoutCertificate）
+## 7. 記事で参照する根拠
 
-`v0.2.0` の「単一 QC 付き Raft」を拡張し、外部のブロックチェーンライブラリを使わずに **「リーダー交代時の安全性（Locking Safety）」と「悪意あるリーダーの沈黙・検閲からの自動回復（View-Change Liveness）」** を約 200 行の純粋 Rust コード（[`veil-node/src/usecase/consensus_engine.rs`](../veil-node/src/usecase/consensus_engine.rs)）で実現します。
-
-### 4.1 なぜ「2段階 QC（`PrepareQC` $\to$ `CommitQC`）」が必要なのか
-
-1段階の QC だけでは、あるエントリ $E$ の QC が「フォロワー1台にだけ届いた直後にリーダーがクラッシュ（または裏切りで隠蔽）」した場合、次の Term のリーダー選出時にその1台が選ばれなかった際、確定したはずの $E$ が失われる（Safety 違反の）可能性があります。
-
-これを防ぐため、HotStuff-2 / PBFT の知見を取り入れた **最小限の 2段階 QC（Locked QC ルール）** を採用します：
-
-1. **Phase 1 (`PrepareQC`)**:
-   - リーダーがログエントリ `(term, index, command)` を提案し、$\lfloor 2N/3 \rfloor + 1$ 台（4台中3台）のフォロワーが `SecurityPolicyGuard` を検証して `PrepareVote` 署名を返す。
-   - リーダーは3台分の署名を束ねて **`PrepareQC`** を生成する。
-2. **Phase 2 (`CommitQC`)**:
-   - リーダーは次の `AppendEntries` で `PrepareQC` を配布する。
-   - フォロワーは有効な `PrepareQC` を受け取った時点で、そのエントリを自身の **`locked_qc`（ロック済み QC）** として記録（WAL に `fsync`）し、**`CommitVote`** 署名を返す。
-   - リーダーは3台分の `CommitVote` を束ねて **`CommitQC`** を生成・配布し、各ノードは `CommitQC` を検証した時点で初めて eBPF マップへ適用（Commit & Apply）する。
-
-> **💡 定足数交差（Quorum Intersection）による安全性の証明**:
-> あるエントリ $E$ に `CommitQC` が形成されたならば、少なくとも $\lfloor 2N/3 \rfloor + 1$ 台（4台中3台）が `PrepareQC` を受け取って `locked_qc` を更新しています。そのうち悪意あるノードは高々 $f=1$ 台なので、**最低でも $f+1=2$ 台の誠実なノードが `locked_qc = PrepareQC(E)` を保持**しています。
-> したがって、次のリーダー選出や `TimeoutCertificate` で任意の $\lfloor 2N/3 \rfloor + 1 = 3$ 台の票を集めると、鳩の巣原理により **必ず最低1台の「`locked_qc` を持つ誠実なノード」がそこに含まれ**、確定済みエントリ $E$ が消えることはあり得ません。
-
-### 4.2 リーダーの沈黙・検閲を打ち破る `TimeoutCertificate` (TC)
-
-フォロワーがローカルセンサーから提案を受け取ってリーダーへ転送したにもかかわらず、`proposal_timeout`（デフォルト `1500ms`、ラウンドごとに指数バックオフ）以内に `CommitQC` が返らない場合：
-
-1. 各フォロワーは現在の `term` の投票を打ち切り、`TimeoutVote { term, voter_id, high_qc: self.locked_qc, signature }` を全ピアへブロードキャストします。
-2. $\lfloor 2N/3 \rfloor + 1$ 台分の有効な `TimeoutVote` が集まると **`TimeoutCertificate` (TC)** が完成します。
-3. TC が完成すると全ノードは `term + 1` へ遷移し、次期リーダーは乱数選挙ではなく **決定論的ラウンドロビン (`leader_id = sorted_nodes[(term + 1) % N]`)** で即座に決まります。
-4. 新リーダーは最初の `AppendEntries` に **TC を添付** しなければならず、かつ **TC 内の全 `TimeoutVote` が報告した `high_qc` のうち最も Term が高いエントリを引き継いで再提案** しなければなりません（フォロワー側で TC と `high_qc` 継承を検証します）。
-
-### 4.3 クラッシュリカバリ時の二重投票を防ぐ最小 WAL (`consensus.wal`)
-
-誠実なノードが電源断やプロセス再起動を起こした際、同じ `term` で異なる候補者・異なるエントリに二重署名してしまう事故を防ぐため、以下の 4 フィールドのみをバイナリレコード（固定 256 バイト + CRC32C）として `/var/lib/veil-mesh/consensus.wal` に書き込み、`fdatasync()` 完了後にのみ署名付き応答を送信します：
-
-- `current_term: u64`
-- `voted_for_in_term: Option<NodeId>`
-- `last_voted_prepare_hash: Option<(u64, u64, [u8; 32])>`
-- `locked_qc: Option<QuorumCertificate>`
-
----
-
-## 5. カーネル eBPF 執行層 (`veil-ebpf`) と Reconciler の詳細設計
-
-### 5.1 `BPF_MAP_TYPE_LPM_TRIE` による IPv4 / IPv6 サブネット遮断と単調増加クロック TTL
-
-`v0.3.0`〜`v0.5.0` で、カーネル空間の [`veil-ebpf/src/veil_xdp_kern.c`](../veil-ebpf/src/veil_xdp_kern.c) を単一 IPv4 ハッシュマップから **IPv4-mapped IPv6 統一キーを持つ `BPF_MAP_TYPE_LPM_TRIE`** に拡張します。
-
-```c
-// キー構造体: IPv4 (/32 -> prefixlen=128 in ::ffff:0:0/96) と IPv6 (/128) を単一の LPM Trie で高速検索
-struct veil_lpm_key {
-    __u32 prefixlen;       // 0..=128
-    __u8  addr_v6[16];     // IPv4 a.b.c.d は ::ffff:a.b.c.d として格納
-} __attribute__((packed));
-
-// バリュー構造体: カーネル単調増加クロックによる自律期限切れ判定付き
-struct veil_peer_policy {
-    __u8  trusted;              // 0 = XDP_DROP, 1 = XDP_PASS
-    __u8  reserved[3];
-    __u32 epoch;                // 合意 log index
-    __u64 expires_at_boot_ns;   // bpf_ktime_get_boot_ns() と比較する有効期限 (0 = 無期限許可のみ)
-} __attribute__((packed));
-```
-
-#### カーネル内 TTL 自動失効のメリット
-
-XDP プログラム内で `if (policy->trusted == 0 && bpf_ktime_get_boot_ns() < policy->expires_at_boot_ns) return XDP_DROP;` と判定します。
-
-- 万が一ユーザー空間の `veil-node` デーモンがクラッシュしたり、ネットワーク分断で合意が停止したりしても、**TTL が切れた瞬間にカーネル XDP 自身が自動的に `XDP_PASS` に戻す** ため、「一時的な遮断のはずがデーモン障害で永久に通信不能になる」という運用事故が構造的に起きません。
-
-### 5.2 輻輳制御（マイクロバッチング）とマップ容量保護
-
-攻撃発生時に WAF や `veil-warden` から秒間数千件の IP シグナルが殺到してもコンセンサスが詰まらないよう、以下の3段階のバックプレッシャーを設けます：
-
-1. **ローカル重複排除（Deduplication）**: すでに `ebpf_policy_map` で遮断中であり、残り TTL が 50% 以上ある IP/CIDR の提案はローカルソケット受信時に即座にスキップします。
-2. **50ms マイクロバッチング**: リーダーは個々の IP ごとに合意を回すのではなく、`50ms` 窓（または最大 `128` 件）の遮断ルールを1つの `MeshCommand::SetPeerTrustBatch(Vec<CidrRule>)` にまとめて提案します。これにより、秒間20回の合意ラウンドで最大 **秒間 2,560 サブネット** の遮断ルールを全ノードへ同期できます。
-3. **Shortest-Remaining-TTL Eviction（容量上限保護）**: `PEER_POLICY_MAP`（上限 `65,536` エントリ）の使用率が `90%` を超えた場合、`Reconciler` は「有効期限切れまでの残り時間が最も短いルール」から順に回収し、新規の攻撃遮断ルールが書き込めなくなる事態を防ぎます。
-
----
-
-## 6. 運用メトリクス（SLI / SLO）と緊急時 Runbook
-
-現場で運用実績を証明できるよう、`veil-node` はローカル管理ポート（`127.0.0.1:9100/metrics`）から Prometheus 形式で以下の SLI を出力します。
-
-| メトリクス名 | 種別 | 運用上の意味と目標 SLO |
-| :--- | :---: | :--- |
-| `veil_consensus_commit_duration_seconds` | Histogram | 提案から `CommitQC` 確定までの所要時間（同一リージョン内 **p99 < 25ms**） |
-| `veil_xdp_packets_total{verdict="drop\|pass"}` | Counter | カーネル XDP で処理・破棄した総パケット数（攻撃吸収量の定量証明） |
-| `veil_active_blocked_cidrs` | Gauge | 現在有効な遮断 CIDR ルール数（上限 65,536 に対する水位監視） |
-| `veil_consensus_view_changes_total` | Counter | `TimeoutCertificate` によるリーダー強制交代の発生回数 |
-| `veil_security_rejected_packets_total{reason}` | Counter | 署名不正・二枚舌・保護 IP 違反で弾いた異常パケット数 |
-| `veil_reconciler_drift_repairs_total` | Counter | ユーザー空間とカーネル BPF マップの不整合を検知・自動修復した回数 |
-
-### 緊急時バイパス手順（Circuit Breaker Runbook）
-
-万が一の運用トラブル時に現場エンジニアが 3 秒で通信を全復旧できるコマンドを用意します：
-
-```bash
-# 1. 特定 IP/CIDR の遮断をクラスタ全体から即時解除する
-veil-node ctl unban 203.0.113.55/32
-
-# 2. 緊急時にローカルノードの XDP フィルタを即座にデタッチして素通しに戻す (root 権限)
-sudo veil-node emergency-detach --iface eth0
-# または標準 Linux コマンド:
-sudo ip link set dev eth0 xdp off
-```
-
----
-
-## 7. v0.9.1 までの実装ロードマップと完了条件（Definition of Done）
-
-| 版 | マイルストーン | 実装対象の Clean Architecture モジュール | 完了条件（自動テストによる検証基準） |
-| :---: | :--- | :--- | :--- |
-| **`v0.2.0`**<br>*(完了済)* | **Clean Architecture 4層分離 & CSPRNG 鍵・保護 IP ガード** | `domain/`, `usecase/`, `adapter/`, `infra/`, `proof_tests.rs` | 全 11 証明・回帰テスト (`proof_1`〜`proof_11`)、Markdown Lint、ShellCheck、Clippy が CI でグリーン。 |
-| **`v0.3.0`**<br>*(完了済)* | **R1〜R10 監査修正：Prefix ハッシュ鎖・Voted-Entry Lock・共有 CA・WAL・XDP ポートバイパス除去** | `domain/entities.rs`, `usecase/consensus_engine.rs`, `adapter/crypto_ring.rs`, `infra/quic_mtls.rs`, `veil-ebpf/` | R1〜R10 回帰テストおよび WAL 復元テストを含む全 20 件（Linux 実機含め 22 件）の自動検証スイートが CI でグリーン。 |
-| **`v0.4.0`** | **2段階 QC (`Prepare`/`Commit`) & 軽量 View-Change (`TC`) + Fuzzing** | `domain/entities.rs` (`TimeoutCertificate`)<br>`usecase/consensus_engine.rs`<br>`fuzz/` (`cargo-fuzz`) | ① リーダープロセスに `SIGSTOP` を送って沈黙させても、残り3台が `TimeoutCertificate` を形成して `term + 1` の新リーダーへ自動交代し、遮断提案が通ること。<br>② `proptest`（10,000 ケース）と `cargo-fuzz` で Panic ゼロ。 |
-| **`v0.5.0`** | **`LPM_TRIE` (IPv4/IPv6 CIDR) & 50ms バッチ + Unix ソケット連携** | `veil-ebpf/src/veil_xdp_kern.c`<br>`infra/sensor_socket.rs`<br>`infra/metrics_prometheus.rs` | ① `/run/veil-mesh/propose.sock` へ 500 件の IPv4/IPv6 CIDR を流し込み、50ms バッチ合意で全ノードの `LPM_TRIE` に反映されること。<br>② [`veil-warden`](https://github.com/mt4110/veil-warden) および Nginx ログ監視からの自動遮断デモが動作すること。 |
-| **`v0.9.1`** | **`veil-arena` カオス試験（遅延・ロス・分断） & 鍵ローテーション** | `scripts/arena-chaos.sh`<br>`docs/OPERATIONS_RUNBOOK.md` | `tc netem` によるパケットロス 20%・遅延 100ms・ネットワーク分断と復旧・リーダー強制停止・偽造パケット注入の複合カオス試験をクリアし、全 SLI メトリクスと `summary.json` 証跡が出力されること。 |
+[公開コードと試験の確認状況](VALIDATION_STATUS.md)、[初期レビューの対象版と反例](review/2026-10-23-REPRODUCTION.md)、[後続ローカル版のクラウド試験](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)を、対象と限界を添えて参照してください。旧設計の目標や機能名だけを、成功した実装・採用価値の根拠にしないでください。

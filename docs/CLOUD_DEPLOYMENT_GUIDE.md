@@ -1,16 +1,12 @@
-# ☁️ クラウド・エッジ環境別の過去の構成案（導入・連携未検証）
+# クラウド・エッジ環境の過去の構成案と確認状況
 
-[README（日本語）](../README.md) · [English README](../README_EN.md) · [証明解説書](CONSENSUS_AND_EBPF_PROOF.md)
+[README](../README.md) · [English README](../README_EN.md) · [公開コード・試験の確認状況](VALIDATION_STATUS.md) · [クラウド試験要約](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)
 
-> **訂正（2026-10-27）：** 本書は過去の構成案です。本実装のAWS・GCP試験では隔離XDPが動作しましたが、試した実NIC構成への装着は失敗しました。Azureの直接導入とCloudflare／Vercelとの連携は未検証です。以下の手順は導入成功を確認した手順ではありません。[試験の公開用要約](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)を参照してください。開発終了・本番導入非推奨の判断は継続します。
+2026-10-27訂正。開発終了・本番導入非推奨。本書は導入成功を確認した手順書ではありません。旧版にあった「Linux VMならそのまま動作」「UDPを許可するだけでメッシュ完成」「3社共通の本番systemd手順」は裏付けがなく、実行可能な導入案内として撤回します。
 
-本書には、開発当時のクラウド・エッジ構成案と未検証の手順例を保存しています。本実装の導入・連携に関する確認状況は次の表を参照してください。
+## 1. プラットフォーム別の確認状況
 
----
-
-## 1. 過去の構成案と本実装の確認状況
-
-`veil-mesh-consensus` は **Linux カーネル空間の eBPF (`BPF_PROG_TYPE_XDP`)** と **UDP 5000 番ポート上の mTLS QUIC 双方向通信** を使用します（LSM 制御は現時点ではユーザー空間ブリッジでシミュレートしており、実カーネルの BPF LSM は `veil-warden` と連携します）。そのため、「利用者自身が Linux カーネル（VM / ベアメタル / 専用ノード）の特権 (`CAP_BPF`, `CAP_NET_ADMIN`) を持てるか」によって導入方式が分かれます。
+AWS・GCPの実測は、公開mainと同じではない後続ローカル版 `veil-local-ban` の記録です。単体hostの隔離XDPと実NIC適合を分け、公開mainの分散防御全体の合格とは扱いません。
 
 | プラットフォーム | 本実装の確認状況 | 過去の構成案 | 検証上の制約 |
 | :--- | :---: | :--- | :--- |
@@ -20,192 +16,46 @@
 | **Cloudflare** (WAF / Workers / Magic Transit) | **連携未検証** | 前段センサー・API遮断同期・オリジン保護 | 対応する連携実装と受入れ記録は未確認。構成案を連携対応の根拠にしない。 |
 | **Vercel** (Functions / Edge Network) | **連携未検証** | フロントエンドと別Linuxバックエンド | 対応する連携実装と受入れ記録は未確認。別ホスト構成の提案を連携成功の根拠にしない。 |
 
-```mermaid
-flowchart TB
-    subgraph EdgeSaaS["エッジ・フロントエンド層 (eBPF 非開放・マネージド領域)"]
-        CF["Cloudflare WAF / Workers<br/>(L7 センサー・エッジキャッシュ)"]
-        Vercel["Vercel<br/>(Next.js フロントエンド / Edge Functions)"]
-    end
+## 2. kernel・NIC・権限と公開版の制約
 
-    subgraph CloudMesh["クラウド VM / ベアメタル層 (AWS EC2 / GCP GCE / Azure VM)"]
-        direction LR
-        NodeA["Node Alpha (AWS/GCP/Azure)<br/>veil-node + Aya XDP/LSM"]
-        NodeB["Node Beta (AWS/GCP/Azure)<br/>veil-node + Aya XDP/LSM"]
-        NodeC["Node Gamma (AWS/GCP/Azure)<br/>veil-node + Aya XDP/LSM"]
-        NodeA <==>|"QUIC UDP:5000<br/>Ed25519 + MultiSig QC"| NodeB
-        NodeB <==>|"QUIC UDP:5000<br/>Ed25519 + MultiSig QC"| NodeC
-    end
+kernel操作の権限があることだけでは、本実装の稼働は保証できません。driver、NIC、MTU、offload、attach方式、object／source／ABI、PKI、通常daemonのruntime、停止復旧を含める必要があります。Linuxの版番号だけを汎用対応の根拠にしません。
 
-    CF ==>|"正規リクエスト / 異常検知シグナル"| NodeA
-    Vercel ==>|"バックエンド API 通信"| NodeB
-    NodeA -.->|"Cloudflare API 同期の構成案・未検証"| CF
-```
+公開mainのXDPはexact IPv4 HASHで、kernel TTLの期限fieldはありません。Rust eBPFソースにはLSM hookがあり、loaderにも任意のattach経路がありますが、同梱C版objectによるLSMの本番受入れやアプリ秘密鍵消去は未実証です。`lsm=bpf` を追加するだけでステルスGCや実アプリ保護が成立するとは案内しません。
 
----
+旧版のGRUB書換え・reboot・NIC MTU変更例は、読者の環境で安全性・復旧・動作を確認した手順ではありません。本書はそれらの実行を推奨しません。通常daemonはXDP attach失敗でもQUIC-onlyで継続するため、起動成功を防御開始と取り違えないでください。
 
-## 2. 共通の事前準備（Linux カーネル要件と `lsm=bpf` の有効化）
+<a id="3-aws-amazon-ec2--vpc-への実践導入手順"></a>
 
-AWS / GCP / Azure いずれの Linux VM（Ubuntu 24.04 LTS 推奨、Kernel 6.8 以降）でも、XDP パケットフィルタはデフォルトでそのまま動作します。さらに **LSM ステルス GC (`lsm=bpf`)** も有効化する場合は、以下の手順を1回だけ実行します。
+## 3. AWS：過去の構成案と試験結果
 
-```bash
-# 1. 現在のカーネルで BTF と LSM がどう設定されているか確認
-ls -lh /sys/kernel/btf/vmlinux
-cat /sys/kernel/security/lsm
+旧案はEC2のENAへのXDPとQUICを組み合わせるものでした。セキュリティグループのUDP許可だけで、安全なPKI・node ID対応・選挙・提案受付・合意・kernel適用が成立するわけではありません。
 
-# 2. もし出力に `bpf` が含まれていない場合は GRUB パラメータに `,bpf` を追加
-sudo sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="lsm=lockdown,capability,landlock,yama,apparmor,bpf /' /etc/default/grub
-sudo update-grub
-sudo reboot
-```
+後続ローカル版の一台試験では、隔離vethの実XDPは合格し、ENA／MTU 9001の実NIC装着は拒否されました。kernelログの3498は当該guestの上限で、全ENA構成への推奨MTUではありません。MTU1500への変更や別modeなら成功するという実測もありません。EKSや他構成は未検証です。[公開用要約](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)を参照してください。
 
----
+<a id="4-gcp-google-compute-engine--vpc-への実践導入手順"></a>
 
-## 3. AWS (Amazon EC2 / VPC) への実践導入手順
+## 4. GCP：過去の構成案と試験結果
 
-AWS の Nitro インスタンス（`t4g`, `c7g`, `m7i` 等）に搭載されている **ENA (Elastic Network Adapter)** は XDP をサポートしており、セキュリティグループでノード間の `UDP 5000` を許可するだけで即座にメッシュを構築できます。
+旧案はgVNICへの装着を想定しましたが、後続ローカル版で実際に試したNICはVirtIO-Net／MTU 1460です。隔離vethの実XDPは合格し、実NICへのFD所有link作成はEINVALで失敗しました。原因はこのエラーだけでは確定できません。
 
-### Step 3.1: セキュリティグループ（VPC ファイアウォール）の設定
+gVNIC、GKE、別driver・mode・offload構成は未検証です。旧案のmachine typeとgVNICの組合せ、`ens4` という名前やfirewall設定例だけを、本実装の導入成功の根拠にしません。
 
-同一 VPC 内の3台の EC2 インスタンス（例: `10.0.1.11`, `10.0.1.12`, `10.0.1.13`）が属するセキュリティグループ `sg-veil-mesh` に、以下のインバウンドルールを追加します。
+<a id="5-microsoft-azure-azure-virtual-machines--vnet-への実践導入手順"></a>
 
-```bash
-# AWS CLI でメッシュ内ノード間の QUIC (UDP 5000) 通信を許可
-aws ec2 authorize-security-group-ingress \
-  --group-id sg-xxxxxxxx \
-  --protocol udp \
-  --port 5000 \
-  --source-group sg-xxxxxxxx
-```
+## 5. Azure：未検証の構成案
 
-### Step 3.2: ENA ドライバのプライマリ NIC 名の確認と起動
+Azure VM／AKS、MANA／Accelerated Networkingへの本実装の装着・運用受入れは未検証です。`eth0` というinterface名を普遍的な条件としません。NSGでUDPを許可したり、rootのsystemd unitを置いたりすれば分散防御が完成するという旧案は、成功した手順ではありません。
 
-Amazon Linux 2023 や Ubuntu on EC2 では、プライマリ NIC 名は通常 `ens5` です。
+<a id="6-cloudflare--vercel-を使う場合のハイブリッド実践構成"></a>
 
-```bash
-# 1. プライマリ NIC 名を確認 (例: ens5)
-ip -br addr show
+## 6. Cloudflare／Vercel：連携未検証の構成案
 
-# 2. リポジトリの取得とビルド
-git clone https://github.com/mt4110/veil-mesh-consensus.git
-cd veil-mesh-consensus
-cargo build --release -p veil-node
+CloudflareのL7観測や遮断APIとオリジンXDPを組み合わせる案、Vercelのfrontendと別Linux backendを分ける案がありました。公開コード・手元の実装と試験文書を調べた範囲では、対応する連携実装・受入れ記録は確認できませんでした。「連携対応」「最も強力」などの推奨表現は撤回しています。
 
-# 3. eBPF XDP バイトコードのコンパイル（または同梱の assets/veil_xdp_kern.o を使用）
-clang -O2 -g -target bpf -c veil-ebpf/src/veil_xdp_kern.c -o assets/veil_xdp_kern.o
+Cloudflareは元の訪問者IPをHTTPヘッダーで渡すことを[説明しています](https://developers.cloudflare.com/support/troubleshooting/restoring-visitor-ips/restoring-original-visitor-ips/)。この情報はアプリ層で検証するもので、XDPが見るL3送信元を利用者IPへ書き換えるわけではありません。proxyのIPを元利用者としてBANすると、他の利用者も巻き込み得ます。
 
-# 4. Node 1 (node-alpha: 10.0.1.11) で起動
-sudo ./target/release/veil-node \
-  --node-id node-alpha \
-  --listen 0.0.0.0:5000 \
-  --peer 10.0.1.12:5000 \
-  --iface ens5 \
-  --ebpf-obj ./assets/veil_xdp_kern.o
-```
+各サービス自体の機能と本作の連携成立は別です。Cloudflare Containers、VM、Workers等の異なる実行形態を、すべて一律に「eBPF禁止」「UDP不可」と断定しません。[Cloud Runの実行契約](https://docs.cloud.google.com/run/docs/container-contract#container_security_restrictions)にある特権コンテナの制約も、そのサービスの条件であり、全クラウドを同じ条件に分類する根拠ではありません。
 
-> **💡 AWS ENA での注意点**: ENA ドライバで Native XDP を動かす際、MTU がジャンボフレーム（`9001`）になっていると XDP アタッチが拒否される場合があります。その場合は `sudo ip link set dev ens5 mtu 1500`（または `3498` 以下）に設定してください。
+## 7. 記事から参照する際の境界
 
----
-
-## 4. GCP (Google Compute Engine / VPC) への実践導入手順
-
-GCP では **gVNIC (`ens4`)** を有効にした Ubuntu 24.04 LTS インスタンス（`e2-standard-2`, `c3-standard-4`, `t2a-standard-2` 等）を使用します。
-
-### Step 4.1: VPC ファイアウォールルールの作成
-
-`veil-mesh-node` ネットワークタグを持つ VM 同士の `UDP 5000` 通信を許可します。
-
-```bash
-gcloud compute firewall-rules create allow-veil-mesh-quic \
-  --network=default \
-  --allow=udp:5000 \
-  --source-tags=veil-mesh-node \
-  --target-tags=veil-mesh-node \
-  --description="Allow QUIC BFT consensus traffic (UDP 5000) between veil-mesh nodes"
-```
-
-### Step 4.2: GCE インスタンス (`ens4`) でのデーモン起動
-
-```bash
-# GCP gVNIC のインターフェース名（通常 ens4）を指定して起動
-sudo ./target/release/veil-node \
-  --node-id node-alpha \
-  --listen 0.0.0.0:5000 \
-  --peer 10.128.0.12:5000 \
-  --iface ens4 \
-  --ebpf-obj ./assets/veil_xdp_kern.o
-```
-
----
-
-## 5. Microsoft Azure (Azure Virtual Machines / VNet) への実践導入手順
-
-Azure では Ubuntu 24.04 LTS または Azure Linux において、プライマリ NIC が **`eth0`** として認識されます。
-
-### Step 5.1: NSG (Network Security Group) で UDP 5000 を許可
-
-```bash
-az network nsg rule create \
-  --resource-group veil-rg \
-  --nsg-name veil-mesh-nsg \
-  --name AllowVeilQuicConsensus \
-  --priority 100 \
-  --source-address-prefixes VirtualNetwork \
-  --destination-address-prefixes VirtualNetwork \
-  --destination-port-ranges 5000 \
-  --protocol Udp \
-  --access Allow
-```
-
-### Step 5.2: Azure VM (`eth0`) での systemd 常駐サービス化
-
-Azure / AWS / GCP 共通で本番運用する際は、以下の `systemd` ユニットファイル (`/etc/systemd/system/veil-node.service`) を配置して自動起動・常駐させます。
-
-```ini
-[Unit]
-Description=veil-mesh-consensus QUIC BFT & eBPF XDP/LSM Daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/veil-mesh-consensus
-ExecStart=/opt/veil-mesh-consensus/target/release/veil-node \
-  --node-id node-alpha \
-  --listen 0.0.0.0:5000 \
-  --peer 10.0.0.12:5000 \
-  --iface eth0 \
-  --ebpf-obj /opt/veil-mesh-consensus/assets/veil_xdp_kern.o
-Restart=always
-RestartSec=2
-LimitMEMLOCK=infinity
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now veil-node
-sudo journalctl -u veil-node -f
-```
-
----
-
-## 6. Cloudflare / Vercel を使う場合のハイブリッド実践構成
-
-> **過去の構成案・連携未検証。** 以下の組合せを実装・検証済みの機能として提供していることは確認できません。導入推奨や防御効果の保証ではありません。
-
-### 6.1 なぜ Vercel や Cloudflare Workers の「内部」には直接入れられないのか？
-
-- **Vercel** や **Cloudflare Workers** は、ユーザーコードをマルチテナントの V8 Isolate や軽量コンテナ上で実行するサーバーレス基盤です。
-- これらの環境ではホスト OS の Linux カーネルやネットワークカード（NIC）がクラウド事業者に管理されており、ユーザーに `bpf()` システムコール（`CAP_BPF` / `CAP_NET_ADMIN`）や UDP 5000 の常時待受ソケットが開放されていません。
-
-### 6.2 過去に提案した組合せと未確認事項
-
-1. **Vercel を使う場合（フロントエンド Next.js ＋ バックエンド API 保護）**:
-   - フロントエンドをVercel、保護対象を別のLinuxバックエンドへ置く構成案でした。本実装による連携・実NIC装着・公開経路の受入れは未確認です。
-   - バックエンド侵害時に分散合意で安全に遮断できることや、不審プロセスを検知・停止できることは、この構成で実証していません。
-2. **Cloudflare を使う場合（Real Client IP 連携 ＆ エッジ API 遮断）**:
-   - Cloudflare プロキシ配下のオリジンサーバーでは、L3/L4 の送信元 IP が Cloudflare のエッジ IP になります。
-   - L7で得た利用者情報を検証し、合意結果をCloudflareの遮断APIへ同期する案はありましたが、対応する連携実装と受入れ記録は確認できません。`CF-Connecting-IP` はHTTPヘッダーであり、XDPが見るパケットのL3送信元を元利用者IPへ変えるものではありません。API同期・オリジン保護の安全性や防御効果は未検証です。
+[確認状況](VALIDATION_STATUS.md)は公開コードの静的確認、[クラウド要約](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)は保存済みローカル試験の要約です。今回の文書訂正は、新しいVM作成・NIC操作・再試験・実請求確認・公開siteの受入れを行ったものではありません。設計案とproviderの一般機能から本実装の対応を推定しないでください。

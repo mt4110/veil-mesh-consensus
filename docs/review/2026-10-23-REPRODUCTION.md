@@ -1,6 +1,6 @@
 # 2026-10-23 レビュー再現手順と証拠
 
-対象は `c8d3f7f`。製品コードを変更せず、一時コピーに [再現ケース](2026-10-23-reproduction-cases.rs) を追加した。**これらの追加テストは、欠陥が存在することをassertする。成功は安全性の確認を意味しない。** 修正後の回帰テストにする場合は、期待する不変条件をassertする形へ書き換える。
+対象は `c8d3f7f`。2026-10-27の公開文書訂正時点のmainを再試験した結果ではありません。[公開版との区別](../VALIDATION_STATUS.md)を参照してください。製品コードを変更せず、一時コピーに [再現ケース](2026-10-23-reproduction-cases.rs) を追加した。**これらの追加テストは、欠陥が存在することをassertする。成功は安全性の確認を意味しない。** 修正後の回帰テストにする場合は、期待する不変条件をassertする形へ書き換える。
 
 ## 保存した証拠
 
@@ -13,12 +13,12 @@ artifacts/review-20261023-kvbx7g1s/
 | ファイル | 内容 |
 | --- | --- |
 | `source-commit.txt` / `source.tar` | レビュー対象のGit commitと追跡ファイルのsnapshot |
-| `linux-original-build.txt` | 無変更HEADのLinuxテストbuild失敗。コマンドと診断抜粋 |
+| `linux-original-build.txt` | 無変更の対象版HEADのLinuxテストbuild失敗。コマンドと診断抜粋 |
 | `linux-proof7-qualified-copy.txt` | 検証コピーの名前参照だけ補正後、隔離vethの実pingによるPASS→DROP→PASS |
 | `macos-reproductions.txt` | 元の10件と追加8件、計18件の実行ログ |
 | `linux-xdp-boundaries.txt` | 最初の追加kernelテストharnessがEINVALで失敗した記録 |
 | `linux-xdp-boundaries-padding-fixed.txt` | harnessのABI paddingを明示的にzeroにした後の実kernel結果 |
-| `process-0.log` / `process-1.log` | 現mainの独立2プロセスがそれぞれ別CAを生成し、mTLSで拒否するログ |
+| `process-0.log` / `process-1.log` | 当時の対象版の独立2プロセスがそれぞれ別CAを生成し、mTLSで拒否するログ |
 | `summary.json` | 環境、検証結果、変更範囲の機械可読な索引 |
 
 最後のkernelテストは製品コードの修正ではなく、追加harnessのsyscall引数構築の修正である。最初の失敗記録も保持した。引数レイアウトとx86_64のsyscall番号はpi-nodeのLinux headerを確認した。
@@ -78,7 +78,7 @@ subprocess.run([
 
 ユーザー指定の `ssh pi-node` を使用。環境はLinux 7.0.0-38-generic x86_64。既存checkoutへ上書きせず、`/tmp/veil-mesh-review-20261023.ZYzrw4` に対象commitを展開した。Rust 1.98.1と既存vendorを用いてbuildした。
 
-元のLinuxテストは `proof_tests.rs:424` の `ebpf_bridge::AyaKernelBridge` が名前解決できずE0433で失敗した。検証コピーだけに `crate::` を加え、その結果を無変更HEADの成功と区別した。
+元のLinuxテストは `proof_tests.rs:424` の `ebpf_bridge::AyaKernelBridge` が名前解決できずE0433で失敗した。検証コピーだけに `crate::` を加え、その結果を無変更の対象版HEADの成功と区別した。
 
 `proof_7` は、事前に存在していた `veth-victim` と `ns-veil-rogue` を使用。既存attachがないことを確認してから、試験所有のXDP linkで実pingの疎通・拒否・解除を確認した。実NIC、経路、既存firewall、namespaceの構成は変更していない。試験終了後、`bpftool net` のXDP一覧が空で、テスト用namespaceからのpingが成功することを確認した。
 
@@ -103,7 +103,7 @@ object SHA-256（ローカル・pi-node一致）:
 
 ## 2プロセスTLS試験
 
-現mainを一時コピーで `cargo build --locked --offline -p veil-node` し、`127.0.0.1` の別UDP portで2プロセスを起動した。両者へ相手のaddressを指定し、約3秒観測した。双方に `invalid peer certificate: BadSignature` が記録され、`Completed QUIC consensus round` は0件だった。観測後は試験が起動した2プロセスだけ終了し、回収した。
+当時の対象版を一時コピーで `cargo build --locked --offline -p veil-node` し、`127.0.0.1` の別UDP portで2プロセスを起動した。両者へ相手のaddressを指定し、約3秒観測した。双方に `invalid peer certificate: BadSignature` が記録され、`Completed QUIC consensus round` は0件だった。観測後は試験が起動した2プロセスだけ終了し、回収した。
 
 ## 変更と保存の境界
 

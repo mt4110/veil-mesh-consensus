@@ -1,111 +1,118 @@
-# `veil-mesh-consensus` コンセンサス & eBPF ブリッジ 検証テスト解説書
+# コンセンサス・eBPF関連のシナリオ試験と制約
 
-本書は、`veil-mesh-consensus` において **mTLS QUIC (`Tokio` + `quinn`) トランスポート上の署名付き合意形成（Raft ベース + Ed25519 `SignedConsensusRpc` + マルチシグ `QuorumCertificate`）** と **Linux カーネル空間の eBPF (`Aya` XDP パケットフィルタ) / ユーザー空間 LSM ブリッジ** がどのように連携し、11 個の検証・回帰テスト (`proof_1` 〜 `proof_11`) で何を確かめているかを解説する技術ドキュメントです。
+[README](../README.md) · [確認状況と根拠](VALIDATION_STATUS.md) · [セキュリティ上の制約](../SECURITY.md)
 
----
+2026-10-27の公開コード確認に基づく説明です。`proof_1`〜`proof_14` は関数名であり、数学的証明・本番合格・全環境対応を意味しません。**今回、製品試験は再実行していません。** テストが存在することと、指定環境で実行・合格したことを分けます。
 
-## 1. クリーンアーキテクチャ構成とデータフロー
+## 1. 実装構成
 
-コードベースは以下の 4 層（Clean Architecture）に分離されています：
+Domainにコマンド・QC・方針、UseCaseに状態機械、Adapterに署名・wire型、InfraにQUIC・bridge・TUIがあります。構造を分離したこと自体で安全性は証明されません。[型](../veil-node/src/domain/entities.rs)、[状態機械](../veil-node/src/usecase/consensus_engine.rs)、[QUIC](../veil-node/src/infra/quic_mtls.rs)、[bridge](../veil-node/src/ebpf_bridge.rs)を参照してください。
 
-1. **Domain 層 (`veil-node/src/domain/`)**: `MeshCommand`, `LogEntry`, `QuorumCertificate` 等のコア型と、保護対象 IP（ループバック等）の誤遮断防止や `index`/`term` の境界値を検査する [`SecurityPolicyGuard`](../veil-node/src/domain/policy.rs)。
-2. **UseCase 層 (`veil-node/src/usecase/`)**: [`ConsensusState`](../veil-node/src/usecase/consensus_engine.rs) ステートマシンと [`EbpfBridge`](../veil-node/src/usecase/ports.rs) 出力ポート。
-3. **Adapter 層 (`veil-node/src/adapter/`)**: OS 乱数 (`SystemRandom`) による Ed25519 鍵生成・ファイル保存を行う [`NodeCryptoIdentity`](../veil-node/src/adapter/crypto_ring.rs) と [`WireMessage`](../veil-node/src/adapter/wire_protocol.rs)。
-4. **Infra 層 (`veil-node/src/infra/`, `ebpf_bridge.rs`, `tui.rs`)**: `quinn` mTLS 通信、Linux `Aya` eBPF ローダー、Ratatui TUI。
+## 2. `proof_1`〜`proof_14` の対象
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alpha as Leader: node-alpha<br/>(QUIC + ConsensusState)
-    participant Beta as Follower: node-beta<br/>(QUIC + ConsensusState)
-    participant Bridge as EbpfBridge<br/>(AyaKernelBridge / Mock)
-    participant Kernel as Linux Kernel eBPF<br/>(XDP & LSM Bridge)
+以下は[公開テストソース](../veil-node/src/proof_tests.rs)を読んで確認したassertionの範囲です。
 
-    Note over Alpha,Beta: 1. ドメイン方針チェック & Ed25519 署名付きコンセンサス提案
-    Alpha->>Alpha: SecurityPolicyGuard::validate_command() -> propose()
-    Alpha->>Beta: mTLS QUIC: SignedConsensusRpc(AppendEntries)
-    Beta->>Beta: Ed25519 公開鍵検証 & 境界値・ダイジェスト検証
-    Beta-->>Alpha: SignedConsensusRpc(AppendEntriesResponse + qc_vote_signature)
+### シナリオ 1：選挙の状態遷移
 
-    Note over Alpha,Kernel: 2. 定足数 (3/4) の QC 署名収集による Commit & 配布
-    Alpha->>Alpha: build QuorumCertificate (3/4 sigs) -> advance_commit_index()
-    Alpha->>Beta: SignedConsensusRpc(AppendEntries + Some(QuorumCertificate))
-    Beta->>Beta: verify_quorum_certificate() -> apply_committed_entries()
+- 関数：`proof_1_election_safety_and_log_up_to_date_check`
+- 検査する範囲：同一プロセス内で特定の投票順序を検査。
+- 結果から言えないこと：任意の故障・再起動順序に対する選挙の証明ではない。
 
-    Note over Beta,Kernel: 3. eBPF ブリッジへの同期
-    Beta->>Bridge: sync_peer_policy(ip, PeerPolicy)
-    Bridge->>Kernel: PEER_POLICY_MAP.insert(ip, trusted=0) -> XDP_DROP
-```
+### シナリオ 2：loopback mTLS QUIC
 
----
+- 関数：`proof_2_three_node_quic_consensus_and_ebpf_xdp_enforcement`
+- 検査する範囲：同一OSプロセス内の4状態機械・実UDPソケットでQCと `check_xdp_packet` を検査。
+- 結果から言えないこと：実kernelへpacketを送る試験でも独立4ホストの受入れでもない。
 
-## 2. 11 個の検証・回帰テスト（`cargo test`）の解説
+### シナリオ 3：分断を模した配送
 
-[`veil-node/src/proof_tests.rs`](../veil-node/src/proof_tests.rs) に実装された 11 個のテストケースは、以下の性質と過去のセキュリティ監査で指摘された回帰項目を検証しています。
+- 関数：`proof_3_network_partition_split_brain_prevention_and_recovery`
+- 検査する範囲：状態機械へ届けるRPCを制御し、少数派・再配送を検査。
+- 結果から言えないこと：実ネットワーク分断や全BFTシナリオの保証ではない。
 
-### 証明 1: Election Safety（単一リーダー選出の安全性）
+### シナリオ 4：Mock LSM・消去
 
-- **テスト関数**: `proof_1_election_safety_and_log_up_to_date_check`
-- **検証内容**: 4ノードクラスタにおいて同一の `Term` で複数の候補者（`node-alpha`, `node-gamma`）が立候補した場合でも、各ノードは1つの候補者にしか投票せず、定足数（3/4）を獲得した1台のみが `Role::Leader` になることを確認します。
+- 関数：`proof_4_ebpf_kernel_bridge_and_lsm_stealth_gc_zeroization`
+- 検査する範囲：`MockEbpfBridge` のpolicyとダミーbufferを検査。
+- 結果から言えないこと：実kernel LSM・実秘密鍵・全コピーの消去ではない。
 
-### 証明 2: 実 mTLS QUIC メッシュ（4ノード）での合意形成と XDP 遮断同期
+### シナリオ 5：不正署名RPC
 
-- **テスト関数**: `proof_2_three_node_quic_consensus_and_ebpf_xdp_enforcement`
-- **検証内容**: 実際の UDP ソケット上の mTLS 1.3 QUIC 双方向ストリーム通信を介して4ノード間でリーダー選出・QC 構築・コミット伝搬が行われ、全ノードの XDP フィルタ状態が `XDP_DROP`（および解除後の `XDP_PASS`）へ切り替わることを確認します。
+- 関数：`proof_5_byzantine_fault_tolerance_ed25519_signature_verification`
+- 検査する範囲：限られた署名者詐称・偽造・改ざんを検査。
+- 結果から言えないこと：任意の侵害ノードによる正規署名の悪用まで証明しない。
 
-### 証明 3: ネットワーク分断（Split-Brain）時の少数派コミット抑止と再合流時の収束
+### シナリオ 6：TUI process
 
-- **テスト関数**: `proof_3_network_partition_split_brain_prevention_and_recovery`
-- **検証内容**: 4ノードが `[alpha]` (1台) と `[beta, gamma, delta]` (3台) に分断された際、孤立した旧リーダー `alpha` の提案はコミットされず、多数派側で確定したポリシーへ分断復旧後にロールバック・収束することを確認します。
+- 関数：`proof_6_tui_arena_mock_attack_process_spawn_and_extermination`
+- 検査する範囲：同一プロセスTUIと試験所有processの停止を検査。
+- 結果から言えないこと：自動攻撃検知・任意processの安全な停止ではない。
 
-### 証明 4: `EbpfBridge` ポート連動と LSM / 鍵ゼロ消去シミュレーション
+### シナリオ 7：条件付き実kernel veth
 
-- **テスト関数**: `proof_4_ebpf_kernel_bridge_and_lsm_stealth_gc_zeroization`
-- **検証内容**: `SetNodeLockdown` がコミットされた際、[`MockEbpfBridge`](../veil-node/src/ebpf_bridge.rs) を通じて `LSM_POLICY_MAP` の更新とメモリ上のダミー秘密鍵データのゼロ消去が呼び出されることを確認します。
+- 関数：`proof_7_live_linux_kernel_xdp_drop_on_veth`
+- 検査する範囲：object・veth・権限が揃えばpingのPASS→DROP→PASSを検査。
+- 結果から言えないこと：前提不足／attach失敗でも `Ok(())`。全testのPASSだけで実行済みと判断できない。
 
-### 証明 5: Ed25519 署名によるなりすまし・偽造・改ざん RPC の棄却
+### シナリオ 8：特定の二枚舌・QC不足
 
-- **テスト関数**: `proof_5_byzantine_fault_tolerance_ed25519_signature_verification`
-- **検証内容**: 送信者 ID の詐称（Identity Spoofing）、未知の秘密鍵による署名偽造、および正規リーダーが署名したペイロードの1ビット改ざんの3パターンが `handle_signed_rpc` で棄却されることを確認します。
+- 関数：`proof_8_leader_equivocation_and_multisig_quorum_certificate_defense`
+- 検査する範囲：署名付きRPC入口で特定の競合・証明不足を検査。
+- 結果から言えないこと：本番用の完成BFTや全viewでの安全性の証明ではない。
 
-### 証明 6: TUI アリーナにおけるモック攻撃プロセス起動と停止
+### シナリオ 9：TLS・wire拒否
 
-- **テスト関数**: `proof_6_tui_arena_mock_attack_process_spawn_and_extermination`
-- **検証内容**: TUI アリーナが4ノードの `ConsensusState` 上で QC 合意を行い、OS 上に起動したモック攻撃プロセスを `SIGKILL` で停止・回収できることを確認します。
+- 関数：`proof_9_network_quic_mtls_and_signed_rpc_rejects_untrusted_tls_and_forged_wire_packets`
+- 検査する範囲：loopback QUICで未信頼TLSや偽造RPCの拒否を検査。
+- 結果から言えないこと：安全な実環境PKI配布・独立host運用を保証しない。
 
-### 証明 7: 実機 Linux カーネル (`veth-victim`) 上での `XDP_DROP` 遮断確認
+### シナリオ 10：match_index・署名数
 
-- **テスト関数**: `proof_7_live_linux_kernel_xdp_drop_on_veth`
-- **検証内容**: Linux 実機環境（`veth-victim` と `ns-veil-rogue` が存在する環境）において、実際の eBPF プログラム (`veil_xdp_kern.o`) が `ping` パケットを NIC 層で `XDP_DROP` し、`trusted=true` で復帰することを確認します。
+- 関数：`proof_10_lying_follower_match_index_cannot_trigger_two_node_commit`
+- 検査する範囲：限定した不正応答と4状態機械の定足数を検査。
+- 結果から言えないこと：署名数だけで決定の一意性や入力の真実性は証明しない。
 
-### 証明 8: リーダー二枚舌（Equivocation）および `commit_qc: None` 単独コミットの拒否
+### シナリオ 11：境界・鍵・保護IP
 
-- **テスト関数**: `proof_8_leader_equivocation_and_multisig_quorum_certificate_defense`
-- **検証内容**: `handle_signed_rpc` の本番経路上で、リーダーが同一 `(term, index)` に異なるハッシュのエントリを送る二枚舌攻撃、`commit_qc: None` のまま `leader_commit` を進める要求、および署名数が定足数（3/4）に満たない QC がすべてフォロワーに拒否されることを確認します。
+- 関数：`proof_11_boundary_validation_index_zero_and_term_max_no_panic_or_saturation`
+- 検査する範囲：index／term、名前由来の既知seed、exact loopback等のcaseを検査。
+- 結果から言えないこと：全境界、全loopback／管理網／gateway保護の網羅確認ではない。
 
-### 証明 9: ネットワーク経路での mTLS 証明書検証と署名付き RPC 強制（監査回帰 #1/#2）
+### シナリオ 12：timeout明示駆動
 
-- **テスト関数**: `proof_9_network_quic_mtls_and_signed_rpc_rejects_untrusted_tls_and_forged_wire_packets`
-- **検証内容**: クラスタ CA 以外が署名した自己署名 QUIC クライアントが mTLS で拒絶されること、および QUIC ネットワーク受信ハンドラ (`handle_connection`) に偽造された高 Term のロックダウン RPC を送っても適用されないことを確認します。
+- 関数：`proof_12_v0_4_view_change_timeout_certificate_rotates_leader_on_censorship`
+- 検査する範囲：`trigger_view_timeout()` を試験から呼び、TCと次termを検査。
+- 結果から言えないこと：通常daemonのtimer、SIGSTOP、独立processの検閲回復を試験していない。
 
-### 証明 10: フォロワーの嘘の `match_index` 報告の棄却と 4ノード定足数（監査回帰 #3/#4）
+### シナリオ 13：TTL・batch・bypass・metrics
 
-- **テスト関数**: `proof_10_lying_follower_match_index_cannot_trigger_two_node_commit`
-- **検証内容**: フォロワーが偽の `entry_hash` や不正な `qc_vote_signature` を伴う `match_index` を返してもリーダーに棄却されること、またリーダー＋フォロワー1台の計2台（2/4）ではコミットが成立せず、3台（3/4）の検証済み QC 署名が必要であることを確認します。
+- 関数：`proof_13_v0_5_ttl_auto_expiry_micro_batch_emergency_bypass_and_prometheus_metrics`
+- 検査する範囲：batchを直接提案し、論理時計を進め、ユーザー空間の判定と文字列を検査。
+- 結果から言えないこと：実時計・kernel TTL、50ms集約処理、kernel bypass、HTTP exporterの受入れではない。
 
-### 証明 11: `index = 0` / `term >= MAX_SAFE_TERM` / CSPRNG 鍵推測耐性 / 保護 IP ガード（監査回帰 #5/N1）
+### シナリオ 14：複合状態機械case
 
-- **テスト関数**: `proof_11_boundary_validation_index_zero_and_term_max_no_panic_or_saturation`
-- **検証内容**:
-  1. `index = 0` のエントリを受信してもアンダーフロー Panic せず拒否すること。
-  2. `term = u64::MAX` および `term = MAX_SAFE_TERM` ちょうどの RPC を受信しても `current_term` が上限に張り付かず拒否すること。
-  3. ノード名（`"node-alpha"`）のハッシュから秘密鍵を推測して署名しても、`SystemRandom` (CSPRNG) 鍵であるため拒否されること。
-  4. 保護対象 IP (`127.0.0.1`) を遮断しようとする提案が `SecurityPolicyGuard` で拒否されること。
+- 関数：`proof_14_v0_9_1_adversarial_chaos_partition_byzantine_flood_and_wal_recovery`
+- 検査する範囲：RPC手動配送、明示WAL保存／別stateへ復元、timeout呼出し、再配送を検査。
+- 結果から言えないこと：tc netem・独立host障害・電源断・実kernel・任意BFT攻撃の網羅試験ではない。
 
----
+## 3. 回帰テストと過去の反例
 
-## 3. 検証コマンドの実行方法
+同じソースにはprefix hash、投票lock、PKI、apply error、鍵mode、catch-up件数、term上限、WAL等の回帰caseがあります。個々のassertionは有限の入力・配送順序を扱い、R1〜R11の全契約や本番運用が完成したことを意味しません。
+
+[c8d3f7fの再現記録](review/2026-10-23-REPRODUCTION.md)は古い版の欠陥をassertする試験です。その成功は安全性の確認とは逆の意味です。後続公開版の修正済み部分を、その旧反例だけから未修正と断定することもしません。
+
+## 4. 実kernel・CI・scriptの判定
+
+`proof_7` のobject不在、veth不在、attach失敗は成功扱いのreturnです。CIのgreen表示、実行件数、テスト名から実kernel実行を推定しません。実行を主張するには対象commit／object／kernel／interfaceと、実packet・counter・停止復帰等の証拠を別に確認する必要があります。
+
+`arena-smoke.sh` はcargo出力を保存した後、固定のPASSと `proof_1`〜`proof_6` のリストを要約へ書きます。実行caseを解析してskipを区別する集計ではなく、Arena全体の認証・互換性試験でもありません。
+
+`check.sh` はShellCheckが見つからなければその検査を実行しません。workspace試験は、除外されているeBPF crateやC版objectをすべて再buildして検証する手順ではありません。
 
 ```bash
+# 開発当時の研究用チェック。各条件付き検査の実行範囲は個別確認
 bash scripts/check.sh
 ```
+
+`deploy-pi-node.sh` は専用hostのnetwork・trace等を変更し得る過去のscriptです。この文書監査では実行していません。製品コード・テストの安全条件を弱めて文書へ合わせる変更もしていません。
