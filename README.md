@@ -35,7 +35,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/mt4110/veil-mesh-consensus)](https://github.com/mt4110/veil-mesh-consensus/releases)
 
-[English](README_EN.md) · [🧭 v0.9.1 実践設計書 & ロードマップ](docs/V1_ARCHITECTURE_AND_ROADMAP.md) · [📋 第三者レビュー & 改訂設計](docs/FEASIBILITY_REVIEW_AND_V1_DESIGN.md) · [☁️ クラウド導入ガイド (AWS/GCP/Azure/CF/Vercel)](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 証明・回帰テスト解説書](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
+[English](README_EN.md) · [🧭 v0.9.1 実践設計書 & ロードマップ](docs/V1_ARCHITECTURE_AND_ROADMAP.md) · [📋 第三者レビュー & 改訂設計](docs/FEASIBILITY_REVIEW_AND_V1_DESIGN.md) · [☁️ クラウド・エッジの過去の構成案（導入・連携未検証）](docs/CLOUD_DEPLOYMENT_GUIDE.md) · [🧪 証明・回帰テスト解説書](docs/CONSENSUS_AND_EBPF_PROOF.md) · [🔒 Security](SECURITY.md) · [🤝 Contributing](CONTRIBUTING.md)
 
 **QUIC (`Tokio` + `quinn` mTLS) 上の署名付き Raft 系合意形成（Ed25519 `SignedConsensusRpc` + マルチシグ `QuorumCertificate`）で決定した遮断ルールを、Linux カーネル空間の eBPF (`Aya` XDP パケットフィルタ) およびユーザー空間 LSM ブリッジへ反映する実験的プロトタイプです。**
 
@@ -219,10 +219,10 @@ nix run .#node-beta
 
 以下は本実装の確認状況です。クラウド側のXDP機能の有無だけでは、本実装の導入成功を保証しません。[AWS・GCP試験の公開用要約](docs/review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)を参照してください。**[旧導入ガイド](docs/CLOUD_DEPLOYMENT_GUIDE.md)は過去の構成案であり、導入成功を確認した手順ではありません。**
 
-| プラットフォーム | 本実装の直接導入の確認状況 | 試験結果・過去の構成案 | 旧ガイド |
+| プラットフォーム | 本実装の直接導入・連携の確認状況 | 試験結果・過去の構成案 | 旧ガイド |
 | :--- | :---: | :--- | :--- |
-| **AWS** (EC2 / EKS) | **手元のEC2試験では実NICに装着できず** | 隔離XDPは合格。ENA／MTU 9001で装着拒否。EKS・別構成は未検証 | [AWS 導入手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#3-aws-amazon-ec2--vpc-への実践導入手順) |
-| **GCP** (Compute Engine / GKE) | **手元のCompute Engine試験では実NICに装着できず** | 隔離XDPは合格。VirtIO-Net／MTU 1460でEINVAL。gVNIC・GKE・別構成は未検証 | [GCP 導入手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#4-gcp-google-compute-engine--vpc-への実践導入手順) |
-| **Microsoft Azure** (Azure VM / AKS) | **未検証** | MANA／Accelerated Networkingを含め本実装の導入成功は未確認 | [Azure 導入手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#5-microsoft-azure-azure-virtual-machines--vnet-への実践導入手順) |
-| **Cloudflare** (WAF / Workers) | **△ 連携対応** | 前段 L7 センサー ＋ オリジン XDP 保護 & API 遮断同期 | [Cloudflare 連携手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
-| **Vercel** (Next.js / Edge) | **✕ 単体不可** | フロントエンド配置 ＋ 裏側バックエンド API クラスタを保護 | [Vercel 連携手順](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
+| **AWS** (EC2 / EKS) | **手元のEC2試験では実NICに装着できず** | 隔離XDPは合格。ENA／MTU 9001で装着拒否。EKS・別構成は未検証 | [AWS 過去の構成案](docs/CLOUD_DEPLOYMENT_GUIDE.md#3-aws-amazon-ec2--vpc-への実践導入手順) |
+| **GCP** (Compute Engine / GKE) | **手元のCompute Engine試験では実NICに装着できず** | 隔離XDPは合格。VirtIO-Net／MTU 1460でEINVAL。gVNIC・GKE・別構成は未検証 | [GCP 過去の構成案](docs/CLOUD_DEPLOYMENT_GUIDE.md#4-gcp-google-compute-engine--vpc-への実践導入手順) |
+| **Microsoft Azure** (Azure VM / AKS) | **未検証** | MANA／Accelerated Networkingを含め本実装の導入成功は未確認 | [Azure 過去の構成案](docs/CLOUD_DEPLOYMENT_GUIDE.md#5-microsoft-azure-azure-virtual-machines--vnet-への実践導入手順) |
+| **Cloudflare** (WAF / Workers) | **連携未検証** | 過去の構成案。API遮断同期・オリジン保護の連携実装と受入れ記録は未確認 | [Cloudflare 過去の構成案](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
+| **Vercel** (Next.js / Edge) | **連携未検証** | 過去の別Linuxバックエンド構成案。連携実装と受入れ記録は未確認 | [Vercel 過去の構成案](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |

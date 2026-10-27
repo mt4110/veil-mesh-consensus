@@ -1,24 +1,24 @@
-# ☁️ クラウド・エッジ環境別 実践導入ガイド（AWS / GCP / Azure / Cloudflare / Vercel）
+# ☁️ クラウド・エッジ環境別の過去の構成案（導入・連携未検証）
 
 [README（日本語）](../README.md) · [English README](../README_EN.md) · [証明解説書](CONSENSUS_AND_EBPF_PROOF.md)
 
-> **訂正（2026-10-27）：** 本書は過去の構成案です。本実装のAWS・GCP試験では隔離XDPが動作しましたが、試した実NIC構成への装着は失敗しました。Azureは未検証です。以下の手順は導入成功を確認した手順ではありません。[試験の公開用要約](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)を参照してください。開発終了・本番導入非推奨の判断は継続します。
+> **訂正（2026-10-27）：** 本書は過去の構成案です。本実装のAWS・GCP試験では隔離XDPが動作しましたが、試した実NIC構成への装着は失敗しました。Azureの直接導入とCloudflare／Vercelとの連携は未検証です。以下の手順は導入成功を確認した手順ではありません。[試験の公開用要約](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)を参照してください。開発終了・本番導入非推奨の判断は継続します。
 
-本書では、`veil-mesh-consensus`（mTLS QUIC 署名付き合意形成 ＋ Linux カーネル eBPF `XDP` / LSM ブリッジ）をパブリッククラウドやエッジプラットフォームへ導入する際の **対応可否マトリクス** と、**各プラットフォーム別のステップバイステップ構築手順** を解説します。
+本書には、開発当時のクラウド・エッジ構成案と未検証の手順例を保存しています。本実装の導入・連携に関する確認状況は次の表を参照してください。
 
 ---
 
-## 1. プラットフォーム別の導入可否マトリクス（結論）
+## 1. 過去の構成案と本実装の確認状況
 
 `veil-mesh-consensus` は **Linux カーネル空間の eBPF (`BPF_PROG_TYPE_XDP`)** と **UDP 5000 番ポート上の mTLS QUIC 双方向通信** を使用します（LSM 制御は現時点ではユーザー空間ブリッジでシミュレートしており、実カーネルの BPF LSM は `veil-warden` と連携します）。そのため、「利用者自身が Linux カーネル（VM / ベアメタル / 専用ノード）の特権 (`CAP_BPF`, `CAP_NET_ADMIN`) を持てるか」によって導入方式が分かれます。
 
-| プラットフォーム | 直接導入（eBPF + QUIC） | 推奨アーキテクチャ・役割 | 理由・技術的根拠 |
+| プラットフォーム | 本実装の確認状況 | 過去の構成案 | 検証上の制約 |
 | :--- | :---: | :--- | :--- |
 | **AWS** (EC2 / EKS) | **試したEC2構成では実NIC装着失敗** | 過去の構成案：ENA XDP | 隔離XDPは合格。ENA／MTU 9001で装着拒否。EKS・別構成は未検証。 |
 | **GCP** (Compute Engine / GKE) | **試したCompute Engine構成では実NIC装着失敗** | 過去の構成案：gVNIC XDP | 隔離XDPは合格。VirtIO-Net／MTU 1460でEINVAL。gVNIC・GKE・別構成は未検証。 |
 | **Microsoft Azure** (Azure VM / AKS) | **未検証** | 過去の構成案：MANA / Accelerated Networking | 本実装の導入成功は未確認。 |
-| **Cloudflare** (WAF / Workers / Magic Transit) | **△ 連携対応（センサー＆エッジ遮断層）** | **前段 L7/L3 エッジセンサー ＋ Webhook 連携** | Cloudflare のサーバー上に顧客の Linux eBPF はロードできないが、**Cloudflare を前段センサー、バックエンド VM クラスタを `veil-mesh-consensus` で守る構成（または合意結果を Cloudflare Firewall API へ自動反映する構成）** が極めて有効なため。 |
-| **Vercel** (Functions / Edge Network) | **✕ 単体導入は不可（バックエンド保護で連携）** | **フロントエンド層（裏側の API クラスタを保護）** | Vercel はマネージドなサーバーレス実行環境（V8 Isolates / Firecracker 抽象化層）であり、利用者に `CAP_BPF` や NIC への XDP アタッチ権限が開放されていないため。Vercel から呼ばれるバックエンド API サーバー群（AWS/GCP/Azure 等）側に本ツールを導入します。 |
+| **Cloudflare** (WAF / Workers / Magic Transit) | **連携未検証** | 前段センサー・API遮断同期・オリジン保護 | 対応する連携実装と受入れ記録は未確認。構成案を連携対応の根拠にしない。 |
+| **Vercel** (Functions / Edge Network) | **連携未検証** | フロントエンドと別Linuxバックエンド | 対応する連携実装と受入れ記録は未確認。別ホスト構成の提案を連携成功の根拠にしない。 |
 
 ```mermaid
 flowchart TB
@@ -38,7 +38,7 @@ flowchart TB
 
     CF ==>|"正規リクエスト / 異常検知シグナル"| NodeA
     Vercel ==>|"バックエンド API 通信"| NodeB
-    NodeA -.->|"合意済み攻撃IPを Cloudflare API へ同期 (任意)"| CF
+    NodeA -.->|"Cloudflare API 同期の構成案・未検証"| CF
 ```
 
 ---
@@ -194,16 +194,18 @@ sudo journalctl -u veil-node -f
 
 ## 6. Cloudflare / Vercel を使う場合のハイブリッド実践構成
 
+> **過去の構成案・連携未検証。** 以下の組合せを実装・検証済みの機能として提供していることは確認できません。導入推奨や防御効果の保証ではありません。
+
 ### 6.1 なぜ Vercel や Cloudflare Workers の「内部」には直接入れられないのか？
 
 - **Vercel** や **Cloudflare Workers** は、ユーザーコードをマルチテナントの V8 Isolate や軽量コンテナ上で実行するサーバーレス基盤です。
 - これらの環境ではホスト OS の Linux カーネルやネットワークカード（NIC）がクラウド事業者に管理されており、ユーザーに `bpf()` システムコール（`CAP_BPF` / `CAP_NET_ADMIN`）や UDP 5000 の常時待受ソケットが開放されていません。
 
-### 6.2 どう組み合わせるのが正解か？（ハイブリッド水際防衛）
+### 6.2 過去に提案した組合せと未確認事項
 
 1. **Vercel を使う場合（フロントエンド Next.js ＋ バックエンド API 保護）**:
-   - フロントエンド（Next.js）は Vercel に置き、そこから通信する **バックエンド API / DB クラスタ（AWS EC2, GCP GCE, Azure VM, さくら VPS, オンプレ Linux 等）** に `veil-mesh-consensus` を導入します。
-   - 万が一バックエンドの1台に脆弱性（PHP / Node.js / Python 等の RCE）があっても、`veil-mesh-consensus` が裏側のサーバー群で合意を取り、攻撃通信を `XDP_DROP`・不審プロセスを `SIGKILL` で水際封鎖します。
+   - フロントエンドをVercel、保護対象を別のLinuxバックエンドへ置く構成案でした。本実装による連携・実NIC装着・公開経路の受入れは未確認です。
+   - バックエンド侵害時に分散合意で安全に遮断できることや、不審プロセスを検知・停止できることは、この構成で実証していません。
 2. **Cloudflare を使う場合（Real Client IP 連携 ＆ エッジ API 遮断）**:
    - Cloudflare プロキシ配下のオリジンサーバーでは、L3/L4 の送信元 IP が Cloudflare のエッジ IP になります。
-   - そのため、オリジン側では **① Cloudflare 以外の IP から直接オリジンへ飛んでくるバイパス攻撃パケットを XDP で即座に `XDP_DROP`** しつつ、**② L7 (`CF-Connecting-IP` ヘッダ) で検知し `veil-mesh-consensus` で過半数合意（Quorum Commit）した攻撃者 IP を、Cloudflare Rulesets API (IP Access Rules) へ Webhook 同期してエッジ側でブロック** する2段構えが最も強力です。
+   - L7で得た利用者情報を検証し、合意結果をCloudflareの遮断APIへ同期する案はありましたが、対応する連携実装と受入れ記録は確認できません。`CF-Connecting-IP` はHTTPヘッダーであり、XDPが見るパケットのL3送信元を元利用者IPへ変えるものではありません。API同期・オリジン保護の安全性や防御効果は未検証です。
