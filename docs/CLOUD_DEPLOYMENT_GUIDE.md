@@ -2,6 +2,8 @@
 
 [README（日本語）](../README.md) · [English README](../README_EN.md) · [証明解説書](CONSENSUS_AND_EBPF_PROOF.md)
 
+> **訂正（2026-10-27）：** 本書は過去の構成案です。本実装のAWS・GCP試験では隔離XDPが動作しましたが、試した実NIC構成への装着は失敗しました。Azureは未検証です。以下の手順は導入成功を確認した手順ではありません。[試験の公開用要約](review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md)を参照してください。開発終了・本番導入非推奨の判断は継続します。
+
 本書では、`veil-mesh-consensus`（mTLS QUIC 署名付き合意形成 ＋ Linux カーネル eBPF `XDP` / LSM ブリッジ）をパブリッククラウドやエッジプラットフォームへ導入する際の **対応可否マトリクス** と、**各プラットフォーム別のステップバイステップ構築手順** を解説します。
 
 ---
@@ -12,9 +14,9 @@
 
 | プラットフォーム | 直接導入（eBPF + QUIC） | 推奨アーキテクチャ・役割 | 理由・技術的根拠 |
 | :--- | :---: | :--- | :--- |
-| **AWS** (EC2 / EKS) | **◎ 対応** | **コア防衛メッシュ層** (Nitro ENA XDP) | 専用 Linux カーネル（Amazon Linux 2023 / Ubuntu 24.04+ / NixOS）上で ENA ドライバの XDP が動作するため。 |
-| **GCP** (Compute Engine / GKE) | **◎ 対応** | **コア防衛メッシュ層** (gVNIC XDP) | `gVNIC` (Google Virtual NIC) が XDP をサポートしており、Ubuntu 等でパケット遮断が可能なため。 |
-| **Microsoft Azure** (Azure VM / AKS) | **◎ 対応** | **コア防衛メッシュ層** (MANA / Accelerated Networking XDP) | Azure Linux / Ubuntu 24.04+ において、高速ネットワーク上の XDP が動作するため。 |
+| **AWS** (EC2 / EKS) | **試したEC2構成では実NIC装着失敗** | 過去の構成案：ENA XDP | 隔離XDPは合格。ENA／MTU 9001で装着拒否。EKS・別構成は未検証。 |
+| **GCP** (Compute Engine / GKE) | **試したCompute Engine構成では実NIC装着失敗** | 過去の構成案：gVNIC XDP | 隔離XDPは合格。VirtIO-Net／MTU 1460でEINVAL。gVNIC・GKE・別構成は未検証。 |
+| **Microsoft Azure** (Azure VM / AKS) | **未検証** | 過去の構成案：MANA / Accelerated Networking | 本実装の導入成功は未確認。 |
 | **Cloudflare** (WAF / Workers / Magic Transit) | **△ 連携対応（センサー＆エッジ遮断層）** | **前段 L7/L3 エッジセンサー ＋ Webhook 連携** | Cloudflare のサーバー上に顧客の Linux eBPF はロードできないが、**Cloudflare を前段センサー、バックエンド VM クラスタを `veil-mesh-consensus` で守る構成（または合意結果を Cloudflare Firewall API へ自動反映する構成）** が極めて有効なため。 |
 | **Vercel** (Functions / Edge Network) | **✕ 単体導入は不可（バックエンド保護で連携）** | **フロントエンド層（裏側の API クラスタを保護）** | Vercel はマネージドなサーバーレス実行環境（V8 Isolates / Firecracker 抽象化層）であり、利用者に `CAP_BPF` や NIC への XDP アタッチ権限が開放されていないため。Vercel から呼ばれるバックエンド API サーバー群（AWS/GCP/Azure 等）側に本ツールを導入します。 |
 

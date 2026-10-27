@@ -88,12 +88,12 @@ bash scripts/arena-smoke.sh
 
 ## ☁️ Cloud & Edge Deployment Matrix (AWS / GCP / Azure / Cloudflare / Vercel)
 
-See **[docs/CLOUD_DEPLOYMENT_GUIDE.md](docs/CLOUD_DEPLOYMENT_GUIDE.md)** for full step-by-step instructions.
+The table describes validation of this implementation. Provider XDP capability alone does not establish successful deployment. See the [public AWS/GCP trial summary](docs/review/2026-10-27-CLOUD-VALIDATION-SUMMARY.md) (Japanese). The [historical deployment guide](docs/CLOUD_DEPLOYMENT_GUIDE.md) describes proposed configurations, not validated deployment procedures.
 
-| Platform | Direct Kernel Support | Recommended Role | Guide Link |
+| Platform | Direct deployment validation | Trial result / historical proposal | Historical guide |
 | :--- | :---: | :--- | :--- |
-| **AWS** (EC2 / EKS) | **Yes** | Nitro ENA Native XDP Defense Mesh | [AWS Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#3-aws-amazon-ec2--vpc-への実践導入手順) |
-| **GCP** (Compute Engine / GKE) | **Yes** | gVNIC XDP Defense Mesh | [GCP Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#4-gcp-google-compute-engine--vpc-への実践導入手順) |
-| **Microsoft Azure** (Azure VM / AKS) | **Yes** | MANA / Accelerated Networking XDP | [Azure Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#5-microsoft-azure-azure-virtual-machines--vnet-への実践導入手順) |
+| **AWS** (EC2 / EKS) | **Real-NIC attachment failed in the local EC2 trial** | Isolated XDP passed; ENA rejected attachment at MTU 9001. EKS and other configurations unverified | [AWS Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#3-aws-amazon-ec2--vpc-への実践導入手順) |
+| **GCP** (Compute Engine / GKE) | **Real-NIC attachment failed in the local Compute Engine trial** | Isolated XDP passed; VirtIO-Net at MTU 1460 returned EINVAL. gVNIC, GKE and other configurations unverified | [GCP Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#4-gcp-google-compute-engine--vpc-への実践導入手順) |
+| **Microsoft Azure** (Azure VM / AKS) | **Unverified** | Deployment of this implementation, including MANA / Accelerated Networking, has not been validated | [Azure Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#5-microsoft-azure-azure-virtual-machines--vnet-への実践導入手順) |
 | **Cloudflare** (WAF / Workers) | **Hybrid** | Edge L7 Sensor + Origin XDP Protection & API Sync | [Cloudflare Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
 | **Vercel** (Next.js / Edge) | **Hybrid Only** | Frontend Hosting + Backend Linux Mesh Protection | [Vercel Guide](docs/CLOUD_DEPLOYMENT_GUIDE.md#6-cloudflare--vercel-を使う場合のハイブリッド実践構成) |
