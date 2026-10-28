@@ -1,0 +1,57 @@
+[Unit]
+Description=Bounded local temporary IPv4 BANs
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=veil-local-ban
+Group=veil-local-ban
+Environment=VEIL_XDP_MODE=default
+EnvironmentFile=/etc/veil-local-ban/service.conf
+ExecStart=/usr/libexec/veil-local-ban serve --systemd-notify --iface ${VEIL_INTERFACE} --xdp-mode ${VEIL_XDP_MODE} --ebpf-object /usr/lib/veil-local-ban/veil_xdp_kern.o --control-dir /var/lib/veil-local-ban/primary --destination ${VEIL_DESTINATION} --port ${VEIL_PORT} --protected-ip ${VEIL_PROTECTED_IP}
+Restart=on-abnormal
+RestartSec=2s
+TimeoutStartSec=10s
+TimeoutStopSec=10s
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+UMask=0077
+
+# No RuntimeDirectory/StateDirectory: systemd must not delete, recursively
+# chown or repair unknown files during start, stop, failure or manual recovery.
+ReadOnlyPaths=/var/lib/veil-local-ban
+ReadWritePaths=/var/lib/veil-local-ban/primary
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service bpf prctl
+SystemCallErrorNumber=EPERM
+LimitMEMLOCK=8M
+TasksMax=32
+MemoryMax=128M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

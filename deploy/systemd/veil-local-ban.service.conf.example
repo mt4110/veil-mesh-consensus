@@ -1,0 +1,14 @@
+# Root-owned configuration; replace documentation addresses before installation.
+# This is an example, not a validated deployment profile. See the site pilot runbook.
+# INTERFACE/DESTINATION/PORT must match the tuple at XDP ingress, not an HTTP header.
+# PROTECTED_IP is an exact source IPv4 that must never be banned; it is not a CIDR.
+# Multiple exceptions require repeated --protected-ip arguments in a reviewed unit.
+# One instance scopes one IPv4/TCP port; IPv6/HTTP3 are outside this profile.
+VEIL_INTERFACE=eth0
+# default keeps flags=0; generic selects SKB_MODE once, with no fallback.
+# Both require LRO and hardware GRO already off in active AND wanted.
+# No automatic ethtool SET; see INSTALL.md before choosing a dedicated NIC.
+VEIL_XDP_MODE=default
+VEIL_DESTINATION=203.0.113.10
+VEIL_PORT=443
+VEIL_PROTECTED_IP=198.51.100.10

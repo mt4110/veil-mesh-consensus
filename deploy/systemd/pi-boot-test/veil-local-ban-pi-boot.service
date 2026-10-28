@@ -1,0 +1,59 @@
+[Unit]
+Description=Bounded local temporary IPv4 BANs
+After=network.target veil-local-ban-pi-namespace.service
+Requires=veil-local-ban-pi-namespace.service
+RequiresMountsFor=/opt/veil-local-ban-pi-full /opt/veil-local-ban-pi-boot /var/lib/veil-local-ban-pi-boot
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+NetworkNamespacePath=/run/netns/ns-veil-rogue
+Type=notify
+NotifyAccess=main
+User=veil-local-ban-pi-full
+Group=veil-local-ban-pi-full
+EnvironmentFile=/opt/veil-local-ban-pi-boot/service.conf
+ExecStart=/opt/veil-local-ban-pi-full/veil-local-ban serve --systemd-notify --iface ${VEIL_INTERFACE} --ebpf-object /opt/veil-local-ban-pi-full/veil_xdp_kern.o --control-dir /var/lib/veil-local-ban-pi-boot/primary --destination ${VEIL_DESTINATION} --port ${VEIL_PORT} --protected-ip ${VEIL_PROTECTED_IP}
+Restart=on-abnormal
+RestartSec=2s
+TimeoutStartSec=10s
+TimeoutStopSec=10s
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+UMask=0077
+
+# No RuntimeDirectory/StateDirectory: systemd must not delete, recursively
+# chown or repair unknown files during start, stop, failure or manual recovery.
+ReadOnlyPaths=/var/lib/veil-local-ban-pi-boot
+ReadWritePaths=/var/lib/veil-local-ban-pi-boot/primary
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service bpf prctl
+SystemCallErrorNumber=EPERM
+LimitMEMLOCK=8M
+TasksMax=32
+MemoryMax=128M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

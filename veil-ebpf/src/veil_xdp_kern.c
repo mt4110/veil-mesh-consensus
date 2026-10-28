@@ -1,13 +1,7 @@
-/*
- * veil-mesh-consensus: Real Linux Kernel XDP Filter for pi-node (`enp0s31f6` / `veth`)
- *
- * Safety Features:
- * 1. Always XDP_PASS non-IPv4 traffic (ARP, IPv6, etc.)
- * 2. Protected management IPs and loopback are guarded by `SecurityPolicyGuard` prior to map insertion.
- *    (Removed TCP port 22/10023 L4 bypass so attackers cannot evade XDP_DROP by spoofing source port 22/10023.)
- * 3. Look up source IPv4 in `PEER_POLICY_MAP`:
- *    - If policy.trusted == 0 -> increment PACKETS_SEEN_MAP[1] (DROP) and return XDP_DROP (1)
- *    - Otherwise -> increment PACKETS_SEEN_MAP[0] (PASS) and return XDP_PASS (2)
+/* Scoped XDP enforcement: exact destination IPv4 + TCP/UDP port,
+ * then source-IP policy and finite boot-clock expiry. Plain Ethernet,
+ * unfragmented IPv4 only. Other traffic passes outside this profile.
+ * Management/source exclusions are validated before map insertion.
  */
 
 typedef unsigned char __u8;
@@ -21,7 +15,6 @@ typedef unsigned long long __u64;
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_FUNC_map_lookup_elem 1
-#define BPF_FUNC_trace_printk 6
 
 #define XDP_ABORTED 0
 #define XDP_DROP 1
@@ -40,6 +33,7 @@ struct peer_policy {
     __u8 trusted;
     __u8 _pad[3];
     __u32 epoch;
+    __u64 expires_at_boot_ns;
 };
 
 /* Legacy map_def format supported by both iproute2 (`ip link set xdp`) and Aya */
@@ -49,6 +43,19 @@ struct bpf_map_def {
     __u32 value_size;
     __u32 max_entries;
     __u32 map_flags;
+};
+
+struct bpf_map_def SEC("maps") XDP_CONTROL = {
+    .type = 2, /* ARRAY: default zero is bypass */
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u32),
+    .max_entries = 1,
+};
+
+struct service_scope_key { __u32 destination; __u16 protocol; __u16 port; };
+struct bpf_map_def SEC("maps") SERVICE_SCOPE = {
+    .type = BPF_MAP_TYPE_HASH, .key_size = sizeof(struct service_scope_key),
+    .value_size = sizeof(__u8), .max_entries = 16,
 };
 
 struct bpf_map_def SEC("maps") PEER_POLICY_MAP = {
@@ -68,7 +75,7 @@ struct bpf_map_def SEC("maps") PACKETS_SEEN_MAP = {
 };
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)BPF_FUNC_map_lookup_elem;
-static long (*bpf_trace_printk)(const char *fmt, __u32 fmt_size, ...) = (void *)BPF_FUNC_trace_printk;
+static __u64 (*bpf_ktime_get_boot_ns)(void) = (void *)125;
 
 static __always_inline __u16 read_be16(const __u8 *p) {
     return ((__u16)p[0] << 8) | (__u16)p[1];
@@ -87,6 +94,12 @@ static __always_inline void record_packet(__u32 idx) {
 
 SEC("xdp")
 int veil_xdp_filter(struct xdp_md *ctx) {
+    __u32 zero = 0;
+    __u32 *enforce = bpf_map_lookup_elem(&XDP_CONTROL, &zero);
+    if (!enforce || *enforce != 1) {
+        record_packet(0);
+        return XDP_PASS;
+    }
     const __u8 *data = (const __u8 *)(unsigned long)ctx->data;
     const __u8 *data_end = (const __u8 *)(unsigned long)ctx->data_end;
 
@@ -106,14 +119,24 @@ int veil_xdp_filter(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
+    /* Exact destination/protocol/port; ambiguous fragments and encapsulation
+     * are outside this narrow profile. Never broaden to the whole host. */
+    if ((ip[0] >> 4) != 4 || (read_be16(ip + 6) & 0x3fff) != 0) return XDP_PASS;
+    __u16 port = 0;
+    if (ip[9] == 6 || ip[9] == 17) {
+        if (data + 14 + ihl + 4 > data_end) return XDP_PASS;
+        port = read_be16(ip + ihl + 2);
+    }
+    struct service_scope_key scope = { .destination = read_be32(ip + 16), .protocol = ip[9], .port = port };
+    if (!bpf_map_lookup_elem(&SERVICE_SCOPE, &scope)) return XDP_PASS;
+
     /* Extract Source IPv4 Address in Host order (matching u32::from(Ipv4Addr)) */
     __u32 src_ip = read_be32(ip + 12);
 
     struct peer_policy *policy = bpf_map_lookup_elem(&PEER_POLICY_MAP, &src_ip);
-    if (policy && policy->trusted == 0) {
+    if (policy && policy->trusted == 0 &&
+        (policy->expires_at_boot_ns == 0 || bpf_ktime_get_boot_ns() < policy->expires_at_boot_ns)) {
         record_packet(1); /* index 1 = XDP_DROP count */
-        const char fmt[] = "VEIL_XDP_DROP: blocked packet from src_ip=0x%x (epoch=%u)\n";
-        bpf_trace_printk(fmt, sizeof(fmt), src_ip, policy->epoch);
         return XDP_DROP;
     }
 

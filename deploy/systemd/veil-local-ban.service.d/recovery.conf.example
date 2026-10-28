@@ -1,0 +1,7 @@
+# Apply only after the manual recovery checks. The one fixed recovery directory
+# must be newly provisioned and empty; never clean or chown unknown old data.
+[Service]
+ExecStart=
+ExecStart=/usr/libexec/veil-local-ban serve --systemd-notify --iface ${VEIL_INTERFACE} --xdp-mode ${VEIL_XDP_MODE} --ebpf-object /usr/lib/veil-local-ban/veil_xdp_kern.o --control-dir /var/lib/veil-local-ban/recovery --destination ${VEIL_DESTINATION} --port ${VEIL_PORT} --protected-ip ${VEIL_PROTECTED_IP}
+ReadWritePaths=
+ReadWritePaths=/var/lib/veil-local-ban/recovery

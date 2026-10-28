@@ -1,5 +1,7 @@
 # DEVELOPMENT DISCONTINUED — veil-mesh-consensus
 
+**Preservation update (2026-10-28):** Later local implementation and trial records have been included in main for historical preservation after development ended. The earlier public-code static review targets `0c58d7179f0616b92893176d24a697330791f503`. Inclusion does not establish fresh runtime validation of the full code or resume development. See the [preserved local document](docs/history/local-final/README_EN.md) and [closure record](docs/PROJECT_CLOSURE.md).
+
 > [!CAUTION]
 > **Development ended on October 27, 2026. This repository preserves experimental research. Production deployment is not recommended.**
 >

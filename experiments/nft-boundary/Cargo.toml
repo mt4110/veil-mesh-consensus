@@ -1,0 +1,11 @@
+[package]
+name = "nft-boundary-offline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Independent experiment: do not change the product workspace or its lockfile.
+[workspace]
+
+[dependencies]

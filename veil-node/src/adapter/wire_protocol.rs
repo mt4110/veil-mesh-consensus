@@ -13,5 +13,5 @@ pub enum WireMessage {
         epoch: u32,
         trusted: bool,
     },
-    Consensus(SignedConsensusRpc),
+    Consensus(Box<SignedConsensusRpc>),
 }

@@ -9,6 +9,8 @@ pub struct PeerPolicy {
     pub trusted: u8,
     pub _pad: [u8; 3],
     pub epoch: u32,
+    /// Absolute CLOCK_BOOTTIME deadline in ns; zero means no expiry.
+    pub expires_at_boot_ns: u64,
 }
 
 impl PeerPolicy {
@@ -17,6 +19,7 @@ impl PeerPolicy {
             trusted: if trusted { 1 } else { 0 },
             _pad: [0; 3],
             epoch,
+            expires_at_boot_ns: 0,
         }
     }
 }
@@ -62,6 +65,15 @@ pub fn evaluate_peer_policy(policy: Option<&PeerPolicy>) -> XdpVerdict {
     }
 }
 
+/// Kernel and simulator must both use the same boot clock for leases.
+#[inline(always)]
+pub fn evaluate_peer_policy_at(policy: Option<&PeerPolicy>, now_ns: u64) -> XdpVerdict {
+    match policy {
+        Some(p) if p.expires_at_boot_ns != 0 && now_ns >= p.expires_at_boot_ns => XdpVerdict::Pass,
+        _ => evaluate_peer_policy(policy),
+    }
+}
+
 /// eBPF LSM (`socket_connect` 等) と User 空間の双方で使用するロックダウン判定ロジック
 /// - `0`: 許可 (Allow)
 /// - `-1` (`-EPERM`): 操作拒否 (Operation not permitted)
@@ -74,6 +86,8 @@ pub fn evaluate_lsm_policy(policy: Option<&NodeLsmPolicy>) -> i32 {
 }
 
 /// eBPF マップ名定数
+/// Zero (including a fresh map) bypasses XDP; one enables enforcement.
+pub const MAP_XDP_CONTROL: &str = "XDP_CONTROL";
 pub const MAP_PEER_POLICY: &str = "PEER_POLICY_MAP";
 pub const MAP_PACKETS_SEEN: &str = "PACKETS_SEEN_MAP";
 pub const MAP_LSM_POLICY: &str = "LSM_POLICY_MAP";
@@ -83,3 +97,15 @@ unsafe impl aya::Pod for PeerPolicy {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for NodeLsmPolicy {}
+
+/// Exact service tuple. Host order, explicit 8-byte ABI without padding.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceScopeKey {
+    pub destination: u32,
+    pub protocol: u16,
+    pub port: u16,
+}
+pub const MAP_SERVICE_SCOPE: &str = "SERVICE_SCOPE";
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ServiceScopeKey {}

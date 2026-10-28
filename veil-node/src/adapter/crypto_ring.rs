@@ -1,5 +1,6 @@
 use crate::domain::{
-    qc_vote_payload, timeout_vote_payload, ConsensusRpc, NodeId, SignedConsensusRpc,
+    qc_vote_payload, rpc_signing_payload, timeout_vote_payload, ConsensusRpc, NodeId,
+    SignedConsensusRpc, SigningContext,
 };
 use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 
@@ -42,7 +43,18 @@ impl NodeCryptoIdentity {
         node_id: impl Into<String>,
         path: &std::path::Path,
     ) -> std::io::Result<Self> {
-        let id = node_id.into();
+        Self::load_file(node_id.into(), path, true)
+    }
+
+    /// Normal validators must never silently replace a missing signing identity.
+    pub fn load_existing_file(
+        node_id: impl Into<String>,
+        path: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        Self::load_file(node_id.into(), path, false)
+    }
+
+    fn load_file(id: String, path: &std::path::Path, allow_create: bool) -> std::io::Result<Self> {
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
@@ -85,61 +97,90 @@ impl NodeCryptoIdentity {
                     public_key_bytes,
                 })
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let rng = ring::rand::SystemRandom::new();
-                let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-                    .map_err(|_| std::io::Error::other("CSPRNG key generation failed"))?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                #[cfg(unix)]
-                {
-                    use std::io::Write;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let mut file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(path)?;
-                    file.write_all(pkcs8.as_ref())?;
-                    file.sync_all()?;
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write(path, pkcs8.as_ref())?;
-                }
-                let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("valid PKCS#8");
-                let public_key_bytes = keypair.public_key().as_ref().to_vec();
-                Ok(Self {
-                    node_id: id,
-                    keypair,
-                    public_key_bytes,
-                })
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && allow_create => {
+                Self::create_new_file(id, path)
             }
             Err(err) => Err(err),
         }
     }
 
+    /// Exclusive key creation. Existing keys are never treated as unused identities.
+    pub fn create_new_file(id: String, path: &std::path::Path) -> std::io::Result<Self> {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+            .map_err(|_| std::io::Error::other("CSPRNG key generation failed"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            file.write_all(pkcs8.as_ref())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, pkcs8.as_ref())?;
+        }
+        let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("valid PKCS#8");
+        let public_key_bytes = keypair.public_key().as_ref().to_vec();
+        Ok(Self {
+            node_id: id,
+            keypair,
+            public_key_bytes,
+        })
+    }
+
     /// `ConsensusRpc` をシリアライズして Ed25519 署名を付与する
-    pub fn sign_rpc(&self, rpc: ConsensusRpc) -> SignedConsensusRpc {
-        let payload = bincode::serialize(&rpc).expect("ConsensusRpc serialization must succeed");
+    pub fn sign_rpc(&self, context: &SigningContext, rpc: ConsensusRpc) -> SignedConsensusRpc {
+        let payload = rpc_signing_payload(context, &self.node_id, &rpc);
         let sig = self.keypair.sign(&payload);
         SignedConsensusRpc {
+            context: context.clone(),
             signer_id: self.node_id.clone(),
             rpc,
             signature: sig.as_ref().to_vec(),
         }
     }
 
+    pub(crate) fn sign_progress_payload(&self, payload: &[u8]) -> Vec<u8> {
+        self.keypair.sign(payload).as_ref().to_vec()
+    }
+
+    pub fn sign_term_support(&self, context: &SigningContext, term: u64) -> Vec<u8> {
+        self.keypair
+            .sign(&crate::domain::term_support_payload(context, term))
+            .as_ref()
+            .to_vec()
+    }
+
     /// 特定のログエントリ `(term, index, entry_hash)` に対する QC 投票署名を計算する
-    pub fn sign_qc_vote(&self, term: u64, index: u64, entry_hash: &[u8; 32]) -> Vec<u8> {
-        let payload = qc_vote_payload(term, index, entry_hash);
+    pub fn sign_qc_vote(
+        &self,
+        context: &SigningContext,
+        term: u64,
+        index: u64,
+        entry_hash: &[u8; 32],
+    ) -> Vec<u8> {
+        let payload = qc_vote_payload(context, term, index, entry_hash);
         self.keypair.sign(&payload).as_ref().to_vec()
     }
 
     /// View-Change 用の `TimeoutVote` `(term, high_qc_term, high_qc_index)` 署名を計算する（v0.4.0）
-    pub fn sign_timeout_vote(&self, term: u64, high_qc_term: u64, high_qc_index: u64) -> Vec<u8> {
-        let payload = timeout_vote_payload(term, high_qc_term, high_qc_index);
+    pub fn sign_timeout_vote(
+        &self,
+        context: &SigningContext,
+        term: u64,
+        high_qc_term: u64,
+        high_qc_index: u64,
+    ) -> Vec<u8> {
+        let payload = timeout_vote_payload(context, term, high_qc_term, high_qc_index);
         self.keypair.sign(&payload).as_ref().to_vec()
     }
 

@@ -14,6 +14,38 @@ use std::{
 use tokio::sync::Mutex;
 use veil_common::{evaluate_lsm_policy, evaluate_peer_policy, XdpVerdict};
 
+// Valid canonical BAN for adversarial RPC fixtures. Obtain the signed-deadline
+// representation through the same proposal path rather than testing rejected legacy data.
+fn finite_test_ban(ip: Ipv4Addr) -> MeshCommand {
+    let mut issuer = ConsensusState::new("fixture", vec![]);
+    issuer.start_signed_election().unwrap();
+    issuer
+        .propose(MeshCommand::set_trust_with_ttl(ip, false, 300))
+        .unwrap()
+        .command
+}
+
+fn retained_test_dir(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "veil-{label}-{}-{stamp}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create test fixture: {e}"),
+        }
+    }
+}
+
 fn make_four_node_cluster() -> (
     ConsensusState,
     ConsensusState,
@@ -34,10 +66,10 @@ fn make_four_node_cluster() -> (
         .collect();
     let pub_keys: BTreeMap<String, Vec<u8>> = states
         .iter()
-        .map(|st| (st.node_id.clone(), st.identity.public_key_bytes.clone()))
+        .map(|st| (st.node_id.clone(), st.identity().public_key_bytes.clone()))
         .collect();
     for st in &mut states {
-        st.register_peer_public_keys(pub_keys.clone());
+        st.register_peer_public_keys(pub_keys.clone()).unwrap();
     }
     let delta = states.pop().unwrap();
     let gamma = states.pop().unwrap();
@@ -51,7 +83,7 @@ fn proof_1_election_safety_and_log_up_to_date_check() {
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
     assert_eq!(alpha.quorum_size(), 3);
 
-    let vote_req_alpha = alpha.start_signed_election();
+    let vote_req_alpha = alpha.start_signed_election().unwrap();
     assert_eq!(alpha.current_term, 1);
     assert_eq!(alpha.role, Role::Candidate);
 
@@ -69,7 +101,7 @@ fn proof_1_election_safety_and_log_up_to_date_check() {
         }
     );
 
-    let vote_req_gamma = gamma.start_signed_election();
+    let vote_req_gamma = gamma.start_signed_election().unwrap();
     let resp_beta_to_gamma = beta.handle_signed_rpc(vote_req_gamma).unwrap().unwrap();
     assert_eq!(
         resp_beta_to_gamma,
@@ -131,13 +163,14 @@ async fn proof_2_three_node_quic_consensus_and_ebpf_xdp_enforcement() -> Result<
     let mut pub_keys = BTreeMap::new();
     for node in [&node_alpha, &node_beta, &node_gamma, &node_delta] {
         let st = node.state.lock().await;
-        pub_keys.insert(st.node_id.clone(), st.identity.public_key_bytes.clone());
+        pub_keys.insert(st.node_id.clone(), st.identity().public_key_bytes.clone());
     }
     for node in [&node_alpha, &node_beta, &node_gamma, &node_delta] {
         node.state
             .lock()
             .await
-            .register_peer_public_keys(pub_keys.clone());
+            .register_peer_public_keys(pub_keys.clone())
+            .unwrap();
     }
 
     let _srv_a = node_alpha.spawn_server();
@@ -155,7 +188,7 @@ async fn proof_2_three_node_quic_consensus_and_ebpf_xdp_enforcement() -> Result<
     );
 
     let log_idx = node_alpha
-        .propose_and_commit(MeshCommand::set_trust(attacker_ip, false))
+        .propose_and_commit(MeshCommand::set_trust_with_ttl(attacker_ip, false, 300))
         .await?;
     assert_eq!(log_idx, 1);
 
@@ -191,7 +224,7 @@ async fn proof_2_three_node_quic_consensus_and_ebpf_xdp_enforcement() -> Result<
 fn proof_3_network_partition_split_brain_prevention_and_recovery() {
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
 
-    let rv = alpha.start_signed_election();
+    let rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let r = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
         let sr = peer.sign_rpc(r);
@@ -201,12 +234,17 @@ fn proof_3_network_partition_split_brain_prevention_and_recovery() {
 
     let suspect_ip = Ipv4Addr::new(10, 0, 0, 50);
     alpha
-        .propose(MeshCommand::set_trust(suspect_ip, false))
+        .propose(MeshCommand::set_trust_with_ttl(suspect_ip, false, 300))
         .unwrap();
     assert_eq!(alpha.commit_index, 0);
     assert_eq!(alpha.check_xdp_packet(suspect_ip), XdpVerdict::Pass);
 
-    let rv_beta = beta.start_signed_election();
+    let pre = beta.start_pre_vote().unwrap();
+    for peer in [&mut gamma, &mut delta] {
+        let reply = peer.handle_signed_rpc(pre.clone()).unwrap().unwrap();
+        beta.handle_signed_rpc(peer.sign_rpc(reply)).unwrap();
+    }
+    let rv_beta = beta.finish_pre_vote().unwrap().unwrap();
     assert_eq!(beta.current_term, 2);
     for peer in [&mut gamma, &mut delta] {
         let r = peer.handle_signed_rpc(rv_beta.clone()).unwrap().unwrap();
@@ -216,7 +254,7 @@ fn proof_3_network_partition_split_brain_prevention_and_recovery() {
     assert_eq!(beta.role, Role::Leader);
 
     let malicious_ip = Ipv4Addr::new(10, 0, 0, 200);
-    beta.propose(MeshCommand::set_trust(malicious_ip, false))
+    beta.propose(MeshCommand::set_trust_with_ttl(malicious_ip, false, 300))
         .unwrap();
 
     for _round in 0..2 {
@@ -257,7 +295,7 @@ fn proof_4_ebpf_kernel_bridge_and_lsm_stealth_gc_zeroization() {
     let mut alpha = alpha_base.with_ebpf_bridge(bridge_alpha.clone());
     let mut beta = beta_base.with_ebpf_bridge(bridge_beta.clone());
 
-    let rv = alpha.start_signed_election();
+    let rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
         let sresp = peer.sign_rpc(resp);
@@ -271,7 +309,7 @@ fn proof_4_ebpf_kernel_bridge_and_lsm_stealth_gc_zeroization() {
 
     let attacker_ip = Ipv4Addr::new(10, 0, 0, 77);
     alpha
-        .propose(MeshCommand::set_trust(attacker_ip, false))
+        .propose(MeshCommand::set_trust_with_ttl(attacker_ip, false, 300))
         .unwrap();
     alpha
         .propose(MeshCommand::set_lockdown("node-beta", true))
@@ -318,7 +356,7 @@ fn proof_5_byzantine_fault_tolerance_ed25519_signature_verification() {
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
     let id_attacker = NodeCryptoIdentity::from_seed("node-mallory", &[99u8; 32]);
 
-    let signed_rv = alpha.start_signed_election();
+    let signed_rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let resp = peer.handle_signed_rpc(signed_rv.clone()).unwrap().unwrap();
         let signed_resp = peer.sign_rpc(resp);
@@ -331,6 +369,7 @@ fn proof_5_byzantine_fault_tolerance_ed25519_signature_verification() {
         leader_id: "node-alpha".into(),
         prev_log_index: 0,
         prev_log_term: 0,
+        prev_log_hash: [0; 32],
         entries: vec![],
         leader_commit: 0,
         commit_qc: None,
@@ -339,14 +378,15 @@ fn proof_5_byzantine_fault_tolerance_ed25519_signature_verification() {
     let err_a = beta.handle_signed_rpc(spoofed_envelope).unwrap_err();
     assert!(err_a.contains("Identity Spoofing"));
 
-    let mut fake_sig_envelope = id_attacker.sign_rpc(forged_ae);
+    let mut fake_sig_envelope =
+        id_attacker.sign_rpc(&crate::domain::SigningContext::simulation(), forged_ae);
     fake_sig_envelope.signer_id = "node-alpha".into();
     let err_b = beta.handle_signed_rpc(fake_sig_envelope).unwrap_err();
     assert!(err_b.contains("invalid Ed25519 signature"));
 
     let target_ip = Ipv4Addr::new(10, 0, 0, 88);
     alpha
-        .propose(MeshCommand::set_trust(target_ip, false))
+        .propose(MeshCommand::set_trust_with_ttl(target_ip, false, 300))
         .unwrap();
     let valid_ae = alpha.make_append_entries("node-beta").unwrap();
     let mut tampered_envelope = alpha.sign_rpc(valid_ae);
@@ -499,13 +539,14 @@ fn proof_8_leader_equivocation_and_multisig_quorum_certificate_defense() {
     let honest_entry = LogEntry {
         term: 1,
         index: 1,
-        command: MeshCommand::set_trust(Ipv4Addr::new(10, 0, 0, 99), false),
+        command: finite_test_ban(Ipv4Addr::new(10, 0, 0, 99)),
     };
     let ae_honest = ConsensusRpc::AppendEntries {
         term: 1,
         leader_id: "node-alpha".into(),
         prev_log_index: 0,
         prev_log_term: 0,
+        prev_log_hash: [0; 32],
         entries: vec![honest_entry.clone()],
         leader_commit: 0,
         commit_qc: None,
@@ -527,13 +568,14 @@ fn proof_8_leader_equivocation_and_multisig_quorum_certificate_defense() {
     let conflicting_entry = LogEntry {
         term: 1,
         index: 1,
-        command: MeshCommand::set_trust(Ipv4Addr::new(10, 0, 0, 1), false),
+        command: finite_test_ban(Ipv4Addr::new(10, 0, 0, 1)),
     };
     let ae_equivocate = ConsensusRpc::AppendEntries {
         term: 1,
         leader_id: "node-alpha".into(),
         prev_log_index: 0,
         prev_log_term: 0,
+        prev_log_hash: [0; 32],
         entries: vec![conflicting_entry],
         leader_commit: 0,
         commit_qc: None,
@@ -552,6 +594,7 @@ fn proof_8_leader_equivocation_and_multisig_quorum_certificate_defense() {
         leader_id: "node-alpha".into(),
         prev_log_index: 1,
         prev_log_term: 1,
+        prev_log_hash: honest_entry.digest(),
         entries: vec![],
         leader_commit: 1,
         commit_qc: None,
@@ -573,7 +616,9 @@ fn proof_8_leader_equivocation_and_multisig_quorum_certificate_defense() {
         entry_hash: hash,
         signatures: BTreeMap::from([(
             "node-alpha".into(),
-            alpha.identity.sign_qc_vote(1, 1, &hash),
+            alpha
+                .identity()
+                .sign_qc_vote(alpha.signing_context(), 1, 1, &hash),
         )]),
     };
     let ae_unilateral_qc = ConsensusRpc::AppendEntries {
@@ -581,6 +626,7 @@ fn proof_8_leader_equivocation_and_multisig_quorum_certificate_defense() {
         leader_id: "node-alpha".into(),
         prev_log_index: 1,
         prev_log_term: 1,
+        prev_log_hash: honest_entry.digest(),
         entries: vec![],
         leader_commit: 1,
         commit_qc: Some(unilateral_qc),
@@ -602,12 +648,20 @@ fn proof_8_leader_equivocation_and_multisig_quorum_certificate_defense() {
         signatures: BTreeMap::from([
             (
                 "node-alpha".into(),
-                alpha.identity.sign_qc_vote(1, 1, &hash),
+                alpha
+                    .identity()
+                    .sign_qc_vote(alpha.signing_context(), 1, 1, &hash),
             ),
-            ("node-beta".into(), beta.identity.sign_qc_vote(1, 1, &hash)),
+            (
+                "node-beta".into(),
+                beta.identity()
+                    .sign_qc_vote(beta.signing_context(), 1, 1, &hash),
+            ),
             (
                 "node-gamma".into(),
-                gamma.identity.sign_qc_vote(1, 1, &hash),
+                gamma
+                    .identity()
+                    .sign_qc_vote(gamma.signing_context(), 1, 1, &hash),
             ),
         ]),
     };
@@ -616,6 +670,7 @@ fn proof_8_leader_equivocation_and_multisig_quorum_certificate_defense() {
         leader_id: "node-alpha".into(),
         prev_log_index: 1,
         prev_log_term: 1,
+        prev_log_hash: honest_entry.digest(),
         entries: vec![],
         leader_commit: 1,
         commit_qc: Some(valid_qc),
@@ -675,6 +730,7 @@ async fn proof_9_network_quic_mtls_and_signed_rpc_rejects_untrusted_tls_and_forg
         leader_id: "node-alpha".into(),
         prev_log_index: 0,
         prev_log_term: 0,
+        prev_log_hash: [0; 32],
         entries: vec![LogEntry {
             term: 500,
             index: 1,
@@ -683,7 +739,10 @@ async fn proof_9_network_quic_mtls_and_signed_rpc_rejects_untrusted_tls_and_forg
         leader_commit: 1,
         commit_qc: None,
     };
-    let mut forged_signed = attacker_identity.sign_rpc(forged_lockdown_rpc);
+    let mut forged_signed = attacker_identity.sign_rpc(
+        &crate::domain::SigningContext::simulation(),
+        forged_lockdown_rpc,
+    );
     forged_signed.signer_id = "node-alpha".into();
 
     let _ = send_rpc_over_quic(&ep_insider, victim_addr, forged_signed).await;
@@ -700,7 +759,7 @@ async fn proof_9_network_quic_mtls_and_signed_rpc_rejects_untrusted_tls_and_forg
 fn proof_10_lying_follower_match_index_cannot_trigger_two_node_commit() {
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
 
-    let rv = alpha.start_signed_election();
+    let rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let r = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
         let sr = peer.sign_rpc(r);
@@ -709,7 +768,11 @@ fn proof_10_lying_follower_match_index_cannot_trigger_two_node_commit() {
     assert_eq!(alpha.role, Role::Leader);
 
     alpha
-        .propose(MeshCommand::set_trust(Ipv4Addr::new(10, 0, 0, 55), false))
+        .propose(MeshCommand::set_trust_with_ttl(
+            Ipv4Addr::new(10, 0, 0, 55),
+            false,
+            300,
+        ))
         .unwrap();
     assert_eq!(alpha.commit_index, 0);
 
@@ -749,6 +812,7 @@ fn proof_11_boundary_validation_index_zero_and_term_max_no_panic_or_saturation()
         leader_id: "node-alpha".into(),
         prev_log_index: 0,
         prev_log_term: 0,
+        prev_log_hash: [0; 32],
         entries: vec![LogEntry {
             term: 1,
             index: 0,
@@ -795,7 +859,9 @@ fn proof_11_boundary_validation_index_zero_and_term_max_no_panic_or_saturation()
         last_log_term: 0,
     };
     assert!(beta
-        .handle_signed_rpc(guessed_alpha.sign_rpc(forged_rv))
+        .handle_signed_rpc(
+            guessed_alpha.sign_rpc(&crate::domain::SigningContext::simulation(), forged_rv)
+        )
         .is_err());
     assert_eq!(beta.rejected_byzantine_packets, 4);
 
@@ -804,7 +870,11 @@ fn proof_11_boundary_validation_index_zero_and_term_max_no_panic_or_saturation()
     alpha.current_term = 1;
     assert!(
         alpha
-            .propose(MeshCommand::set_trust(Ipv4Addr::LOCALHOST, false))
+            .propose(MeshCommand::set_trust_with_ttl(
+                Ipv4Addr::LOCALHOST,
+                false,
+                300
+            ))
             .is_err(),
         "Domain SecurityPolicyGuard must block attempts to XDP_DROP localhost (127.0.0.1)!"
     );
@@ -813,6 +883,38 @@ fn proof_11_boundary_validation_index_zero_and_term_max_no_panic_or_saturation()
 // ==============================================================================
 // R1〜R10 セキュリティ監査（2026-10-23）回帰テストスイート
 // ==============================================================================
+
+// These adversarial fixtures deliberately supply valid quorum term evidence
+// so prefix/QC rejection remains tested behind the new admission boundary.
+fn audit_admit_term(node: &mut ConsensusState, voters: &[&ConsensusState], term: u64) {
+    let mut votes = BTreeMap::new();
+    votes.insert(
+        node.node_id.clone(),
+        node.identity()
+            .sign_term_support(node.signing_context(), term),
+    );
+    for voter in voters {
+        votes.insert(
+            voter.node_id.clone(),
+            voter
+                .identity()
+                .sign_term_support(node.signing_context(), term),
+        );
+    }
+    let peer = voters[0];
+    let rpc = ConsensusRpc::RequestVoteResponse {
+        term,
+        voter_id: peer.node_id.clone(),
+        vote_granted: false,
+    };
+    let wrapper = ConsensusRpc::TermCertified {
+        term,
+        sender_id: peer.node_id.clone(),
+        certificate: crate::domain::TermCertificate::PreVote { term, votes },
+        rpc_bytes: bincode::serialize(&rpc).unwrap(),
+    };
+    node.handle_signed_rpc(peer.sign_rpc(wrapper)).unwrap();
+}
 
 #[allow(clippy::too_many_arguments)]
 fn audit_append(
@@ -831,6 +933,7 @@ fn audit_append(
             leader_id: leader.node_id.clone(),
             prev_log_index,
             prev_log_term,
+            prev_log_hash: follower.entry_hash_at(prev_log_index).unwrap_or([0; 32]),
             entries,
             leader_commit,
             commit_qc,
@@ -860,7 +963,8 @@ fn audit_qc(
     let mut signatures: BTreeMap<String, Vec<u8>> = others.into_iter().collect();
     signatures.insert(
         a.node_id.clone(),
-        a.identity.sign_qc_vote(term, index, &entry_hash),
+        a.identity()
+            .sign_qc_vote(a.signing_context(), term, index, &entry_hash),
     );
     QuorumCertificate {
         term,
@@ -877,7 +981,7 @@ fn regression_r1_tail_qc_rejects_conflicting_prefixes() {
     let x = LogEntry {
         term: 1,
         index: 1,
-        command: MeshCommand::set_trust(ip, false),
+        command: finite_test_ban(ip),
     };
     let y = LogEntry {
         term: 1,
@@ -945,12 +1049,12 @@ fn regression_r1_tail_qc_rejects_conflicting_prefixes() {
 
 #[test]
 fn regression_r2_hidden_qc_rejects_conflicting_commits_across_terms() {
-    let (a, mut b, mut c, mut d) = make_four_node_cluster();
+    let (mut a, mut b, mut c, mut d) = make_four_node_cluster();
     let ip = Ipv4Addr::new(203, 0, 113, 55);
     let x = LogEntry {
         term: 1,
         index: 1,
-        command: MeshCommand::set_trust(ip, false),
+        command: finite_test_ban(ip),
     };
     let y = LogEntry {
         term: 2,
@@ -973,6 +1077,7 @@ fn regression_r2_hidden_qc_rejects_conflicting_commits_across_terms() {
     assert_eq!(b.check_xdp_packet(ip), XdpVerdict::Drop);
 
     // A が Term 2 で C の未コミット（だが投票ロック済み）の x を QC なしで y に上書きしようとしても C は拒否する
+    audit_admit_term(&mut a, &[&b, &c], 2);
     let resp_c = audit_append(&a, &mut c, 2, 0, 0, vec![y.clone()], 0, None);
     assert!(matches!(
         resp_c,
@@ -994,7 +1099,7 @@ fn regression_r2_hidden_qc_rejects_conflicting_commits_across_terms() {
 
 #[test]
 fn regression_r2_term_sandwich_prevents_double_voting_on_same_slot() {
-    let (a, mut b, _c, _d) = make_four_node_cluster();
+    let (mut a, mut b, c, d) = make_four_node_cluster();
     let x = LogEntry {
         term: 1,
         index: 1,
@@ -1008,11 +1113,12 @@ fn regression_r2_term_sandwich_prevents_double_voting_on_same_slot() {
     let y = LogEntry {
         term: 1,
         index: 1,
-        command: MeshCommand::set_trust(Ipv4Addr::new(203, 0, 113, 55), false),
+        command: finite_test_ban(Ipv4Addr::new(203, 0, 113, 55)),
     };
 
     let _sx = audit_sig(audit_append(&a, &mut b, 1, 0, 0, vec![x], 0, None));
     // Term 2 の QC なし上書き自体が拒否され、さらに Term 1 の別内容 y の混ぜ込みも拒否される
+    audit_admit_term(&mut a, &[&c, &d], 2);
     let resp_z = audit_append(&a, &mut b, 2, 0, 0, vec![z], 0, None);
     assert!(matches!(
         resp_z,
@@ -1028,8 +1134,8 @@ fn regression_r2_term_sandwich_prevents_double_voting_on_same_slot() {
             assert!(!success);
             assert!(qc_vote_signature.is_empty());
             assert!(!NodeCryptoIdentity::verify_signature(
-                &b.identity.public_key_bytes,
-                &crate::domain::qc_vote_payload(1, 1, &y.digest()),
+                &b.identity().public_key_bytes,
+                &crate::domain::qc_vote_payload(a.signing_context(), 1, 1, &y.digest()),
                 &qc_vote_signature
             ));
         }
@@ -1040,9 +1146,7 @@ fn regression_r2_term_sandwich_prevents_double_voting_on_same_slot() {
 #[tokio::test]
 async fn regression_r3_multi_process_shared_ca_pki_handshakes_over_mtls() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let temp_dir =
-        std::env::temp_dir().join(format!("veil-mesh-r3-pki-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    let temp_dir = retained_test_dir("pki");
 
     // 独立した2つの ClusterMtlsPki インスタンスが同じディレクトリから共通 CA をロードして mTLS 通信できることを検証
     let pki_proc_1 = ClusterMtlsPki::load_or_generate_dir(&temp_dir)?;
@@ -1064,7 +1168,6 @@ async fn regression_r3_multi_process_shared_ca_pki_handshakes_over_mtls() -> Res
     let _srv = node_1.spawn_server();
 
     crate::infra::send_ping_round(&ep_2, addr_1, "node-beta", 1).await?;
-    let _ = std::fs::remove_dir_all(&temp_dir);
     Ok(())
 }
 
@@ -1089,7 +1192,8 @@ fn regression_r4_apply_error_is_not_reported_as_applied() {
     let mut node = ConsensusState::new("single-node", vec![]).with_ebpf_bridge(bridge.clone());
     node.start_election();
     let ip = Ipv4Addr::new(203, 0, 113, 55);
-    node.propose(MeshCommand::set_trust(ip, false)).unwrap();
+    node.propose(MeshCommand::set_trust_with_ttl(ip, false, 300))
+        .unwrap();
 
     assert_eq!(bridge.0.load(Ordering::SeqCst), 1);
     assert_eq!(node.commit_index, 1);
@@ -1103,7 +1207,7 @@ fn regression_r4_apply_error_is_not_reported_as_applied() {
 async fn regression_r4_propose_and_commit_fails_when_peers_unreachable() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (mut alpha, mut beta, mut gamma, _delta) = make_four_node_cluster();
-    let vote = alpha.start_signed_election();
+    let vote = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma] {
         let response = peer.handle_signed_rpc(vote.clone()).unwrap().unwrap();
         alpha.handle_signed_rpc(peer.sign_rpc(response)).unwrap();
@@ -1125,7 +1229,11 @@ async fn regression_r4_propose_and_commit_fails_when_peers_unreachable() -> Resu
     };
 
     let res = node
-        .propose_and_commit(MeshCommand::set_trust(Ipv4Addr::new(10, 0, 0, 99), false))
+        .propose_and_commit(MeshCommand::set_trust_with_ttl(
+            Ipv4Addr::new(10, 0, 0, 99),
+            false,
+            300,
+        ))
         .await;
     assert!(
         res.is_err(),
@@ -1141,9 +1249,7 @@ async fn regression_r4_propose_and_commit_fails_when_peers_unreachable() -> Resu
 #[test]
 fn regression_r8_insecure_key_file_permissions_are_rejected() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let unique_dir =
-        std::env::temp_dir().join(format!("veil-mesh-r8-key-perm-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&unique_dir);
+    let unique_dir = retained_test_dir("key-perm");
     std::fs::create_dir_all(&unique_dir)?;
     let key_path = unique_dir.join("review-generated-identity.pk8");
 
@@ -1158,7 +1264,6 @@ fn regression_r8_insecure_key_file_permissions_are_rejected() -> Result<()> {
         .expect("0644 key file must be rejected");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 
-    let _ = std::fs::remove_dir_all(&unique_dir);
     Ok(())
 }
 
@@ -1201,25 +1306,21 @@ fn regression_r9_catch_up_batch_is_chunked_within_receiver_limit() {
 #[test]
 fn regression_r10_last_accepted_term_never_revotes_in_same_term() {
     let (a, mut b, _c, _d) = make_four_node_cluster();
-    b.handle_signed_rpc(a.sign_rpc(ConsensusRpc::RequestVote {
-        term: crate::domain::MAX_SAFE_TERM - 1,
-        candidate_id: a.node_id.clone(),
-        last_log_index: 0,
-        last_log_term: 0,
-    }))
-    .unwrap();
-    assert_eq!(b.voted_for, Some(a.node_id.clone()));
-
-    let previous = b.current_term;
-    b.start_election();
-    // MAX_SAFE_TERM - 1 からの選挙では Term が MAX_SAFE_TERM へ単調増加する
-    assert_eq!(b.current_term, previous + 1);
-    assert_eq!(b.voted_for, Some(b.node_id.clone()));
-
-    // さらに MAX_SAFE_TERM 上限に張り付いた状態では、それ以上 Term を増やせないため voted_for を上書きしない
+    assert!(b
+        .handle_signed_rpc(a.sign_rpc(ConsensusRpc::RequestVote {
+            term: crate::domain::MAX_SAFE_TERM - 1,
+            candidate_id: a.node_id.clone(),
+            last_log_index: 0,
+            last_log_term: 0,
+        }))
+        .is_err());
+    assert_eq!(b.current_term, 0);
+    // Seed a legacy exhausted WAL state to test the local terminal guard too.
+    b.current_term = crate::domain::MAX_SAFE_TERM - 1;
     b.voted_for = Some(a.node_id.clone());
+    assert!(b.start_signed_election().is_err());
     b.start_election();
-    assert_eq!(b.current_term, crate::domain::MAX_SAFE_TERM);
+    assert_eq!(b.current_term, crate::domain::MAX_SAFE_TERM - 1);
     assert_eq!(b.voted_for, Some(a.node_id));
 }
 
@@ -1293,6 +1394,8 @@ fn regression_r6_r7_linux_xdp_source_port_no_bypass_and_map_capacity() -> Result
         return Ok(());
     }
     let fd = program.fd()?.as_fd().as_raw_fd();
+    aya::maps::Array::<_, u32>::try_from(bpf.map_mut(veil_common::MAP_XDP_CONTROL).unwrap())?
+        .set(0, 1, 0)?;
     let blocked_ip = u32::from(Ipv4Addr::new(203, 0, 113, 55));
     let mut map: aya::maps::HashMap<_, u32, veil_common::PeerPolicy> =
         aya::maps::HashMap::try_from(bpf.map_mut("PEER_POLICY_MAP").unwrap())?;
@@ -1313,12 +1416,11 @@ fn regression_r6_r7_linux_xdp_source_port_no_bypass_and_map_capacity() -> Result
 #[test]
 fn regression_wal_crash_recovery_prevents_double_vote_and_restores_ebpf_state() -> Result<()> {
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
-    let wal_dir = std::env::temp_dir().join(format!("veil-mesh-wal-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    let wal_dir = retained_test_dir("wal");
     std::fs::create_dir_all(&wal_dir)?;
     let wal_path = wal_dir.join("node-beta.wal");
 
-    let rv = alpha.start_signed_election();
+    let rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
         alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
@@ -1327,7 +1429,7 @@ fn regression_wal_crash_recovery_prevents_double_vote_and_restores_ebpf_state() 
 
     let blocked_ip = Ipv4Addr::new(198, 51, 100, 77);
     alpha
-        .propose(MeshCommand::set_trust(blocked_ip, false))
+        .propose(MeshCommand::set_trust_with_ttl(blocked_ip, false, 300))
         .unwrap();
     for _round in 0..2 {
         for (peer_name, peer) in [
@@ -1356,7 +1458,9 @@ fn regression_wal_crash_recovery_prevents_double_vote_and_restores_ebpf_state() 
         ],
     )
     .with_ebpf_bridge(bridge_rebooted.clone());
-    beta_rebooted.register_peer_public_keys(beta.peer_public_keys.clone());
+    beta_rebooted
+        .register_peer_public_keys(beta.peer_public_keys().clone())
+        .unwrap();
     beta_rebooted.load_wal(&wal_path)?;
 
     assert_eq!(beta_rebooted.current_term, 1);
@@ -1387,7 +1491,6 @@ fn regression_wal_crash_recovery_prevents_double_vote_and_restores_ebpf_state() 
         }
     );
 
-    let _ = std::fs::remove_dir_all(&wal_dir);
     Ok(())
 }
 
@@ -1396,7 +1499,7 @@ fn proof_12_v0_4_view_change_timeout_certificate_rotates_leader_on_censorship() 
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
 
     // Term 1: alpha がリーダーに選出される
-    let rv = alpha.start_signed_election();
+    let rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
         alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
@@ -1407,7 +1510,7 @@ fn proof_12_v0_4_view_change_timeout_certificate_rotates_leader_on_censorship() 
     // まず 1件 (Index 1) を正常コミットして highest_qc を形成させる
     let first_ip = Ipv4Addr::new(198, 51, 100, 1);
     alpha
-        .propose(MeshCommand::set_trust(first_ip, false))
+        .propose(MeshCommand::set_trust_with_ttl(first_ip, false, 300))
         .unwrap();
     for _round in 0..2 {
         for (peer_name, peer) in [
@@ -1426,9 +1529,9 @@ fn proof_12_v0_4_view_change_timeout_certificate_rotates_leader_on_censorship() 
 
     // ここからリーダー alpha が沈黙・検閲攻撃を開始したと仮定。
     // 誠実な 3台 (beta, gamma, delta) が Term 1 に対する TimeoutVote を生成し相互ブロードキャストする。
-    let tv_beta = beta.trigger_view_timeout();
-    let tv_gamma = gamma.trigger_view_timeout();
-    let tv_delta = delta.trigger_view_timeout();
+    let tv_beta = beta.trigger_view_timeout().unwrap();
+    let tv_gamma = gamma.trigger_view_timeout().unwrap();
+    let tv_delta = delta.trigger_view_timeout().unwrap();
 
     for tv in [tv_beta, tv_gamma, tv_delta] {
         beta.handle_signed_rpc(tv.clone()).unwrap();
@@ -1448,7 +1551,7 @@ fn proof_12_v0_4_view_change_timeout_certificate_rotates_leader_on_censorship() 
 
     // 新リーダー beta が新しい遮断ルール (Index 2) を提案・コミットできることを確認
     let second_ip = Ipv4Addr::new(198, 51, 100, 2);
-    beta.propose(MeshCommand::set_trust(second_ip, false))
+    beta.propose(MeshCommand::set_trust_with_ttl(second_ip, false, 300))
         .unwrap();
     for _round in 0..2 {
         for (peer_name, peer) in [("node-gamma", &mut gamma), ("node-delta", &mut delta)] {
@@ -1467,7 +1570,7 @@ fn proof_12_v0_4_view_change_timeout_certificate_rotates_leader_on_censorship() 
 fn proof_13_v0_5_ttl_auto_expiry_micro_batch_emergency_bypass_and_prometheus_metrics() {
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
 
-    let rv = alpha.start_signed_election();
+    let rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
         alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
@@ -1507,13 +1610,13 @@ fn proof_13_v0_5_ttl_auto_expiry_micro_batch_emergency_bypass_and_prometheus_met
     assert_eq!(beta.ebpf_policy_map.len(), 50);
 
     // 2. 緊急ローカルバイパス (bypass-local on) の動作確認
-    beta.set_emergency_local_bypass(true);
+    beta.set_emergency_local_bypass(true).unwrap();
     assert_eq!(beta.check_xdp_packet(sample_ip), XdpVerdict::Pass);
     let metrics_bypass = beta.render_prometheus_metrics();
     assert!(metrics_bypass.contains("veil_emergency_local_bypass{node=\"node-beta\"} 1"));
     assert!(metrics_bypass.contains("veil_ebpf_blocked_ips{node=\"node-beta\"} 50"));
 
-    beta.set_emergency_local_bypass(false);
+    beta.set_emergency_local_bypass(false).unwrap();
     assert_eq!(beta.check_xdp_packet(sample_ip), XdpVerdict::Drop);
 
     // 3. 単調増加クロックを 30秒進める（TTL 60秒未満なのでまだ Drop 維持）
@@ -1530,13 +1633,12 @@ fn proof_13_v0_5_ttl_auto_expiry_micro_batch_emergency_bypass_and_prometheus_met
 #[test]
 fn proof_14_v0_9_1_adversarial_chaos_partition_byzantine_flood_and_wal_recovery() -> Result<()> {
     let (mut alpha, mut beta, mut gamma, mut delta) = make_four_node_cluster();
-    let wal_dir = std::env::temp_dir().join(format!("veil-chaos-v091-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    let wal_dir = retained_test_dir("chaos");
     std::fs::create_dir_all(&wal_dir)?;
     let gamma_wal = wal_dir.join("gamma.wal");
 
     // Step 1: Term 1 で alpha がリーダーになり、攻撃 IP #1 (TTL 120s) をコミット
-    let rv = alpha.start_signed_election();
+    let rv = alpha.start_signed_election().unwrap();
     for peer in [&mut beta, &mut gamma, &mut delta] {
         let resp = peer.handle_signed_rpc(rv.clone()).unwrap().unwrap();
         alpha.handle_signed_rpc(peer.sign_rpc(resp)).unwrap();
@@ -1564,6 +1666,7 @@ fn proof_14_v0_9_1_adversarial_chaos_partition_byzantine_flood_and_wal_recovery(
         leader_id: "node-delta".into(),
         prev_log_index: 1,
         prev_log_term: 1,
+        prev_log_hash: [0; 32],
         entries: vec![],
         leader_commit: 1,
         commit_qc: None,
@@ -1580,16 +1683,20 @@ fn proof_14_v0_9_1_adversarial_chaos_partition_byzantine_flood_and_wal_recovery(
         "node-gamma",
         vec!["node-alpha".into(), "node-beta".into(), "node-delta".into()],
     );
-    gamma_rebooted.identity = gamma.identity.clone();
-    gamma_rebooted.register_peer_public_keys(gamma.peer_public_keys.clone());
+    gamma_rebooted
+        .set_crypto_identity(gamma.identity().clone())
+        .unwrap();
+    gamma_rebooted
+        .register_peer_public_keys(gamma.peer_public_keys().clone())
+        .unwrap();
     gamma_rebooted.load_wal(&gamma_wal)?;
     assert_eq!(gamma_rebooted.commit_index, 1);
     assert_eq!(gamma_rebooted.check_xdp_packet(ip1), XdpVerdict::Drop);
 
     // Step 4: TimeoutCertificate による View-Change で Term 2 の新リーダー beta へ移行し、ip2 を追加合意
-    let tv_b = beta.trigger_view_timeout();
-    let tv_g = gamma_rebooted.trigger_view_timeout();
-    let tv_d = delta.trigger_view_timeout();
+    let tv_b = beta.trigger_view_timeout().unwrap();
+    let tv_g = gamma_rebooted.trigger_view_timeout().unwrap();
+    let tv_d = delta.trigger_view_timeout().unwrap();
     for tv in [tv_b, tv_g, tv_d] {
         beta.handle_signed_rpc(tv.clone()).unwrap();
         gamma_rebooted.handle_signed_rpc(tv.clone()).unwrap();
@@ -1628,6 +1735,5 @@ fn proof_14_v0_9_1_adversarial_chaos_partition_byzantine_flood_and_wal_recovery(
         assert_eq!(node.check_xdp_packet(ip2), XdpVerdict::Drop);
     }
 
-    let _ = std::fs::remove_dir_all(&wal_dir);
     Ok(())
 }

@@ -23,6 +23,7 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone)]
 pub struct SecurityPolicyGuard {
     /// 遮断禁止（保護対象）の IPv4 アドレス集合 (`u32` host-order)
+    pub approval: Option<super::ApprovalPolicy>,
     pub protected_ips: BTreeSet<u32>,
 }
 
@@ -32,7 +33,10 @@ impl Default for SecurityPolicyGuard {
         // ループバック (127.0.0.1) および未指定 (0.0.0.0) は常に遮断禁止
         protected_ips.insert(u32::from(Ipv4Addr::LOCALHOST));
         protected_ips.insert(u32::from(Ipv4Addr::UNSPECIFIED));
-        Self { protected_ips }
+        Self {
+            protected_ips,
+            approval: None,
+        }
     }
 }
 
@@ -43,6 +47,37 @@ impl SecurityPolicyGuard {
 
     /// 提案されたコマンドがドメインの安全方針に違反していないか検証する
     pub fn validate_command(&self, cmd: &MeshCommand) -> Result<(), &'static str> {
+        if self.approval.is_some()
+            && !matches!(
+                cmd,
+                MeshCommand::AuthorizedPolicy(_)
+                    | MeshCommand::NoOp
+                    | MeshCommand::RetireExpired { .. }
+            )
+        {
+            return Err("Independent operator approval required; raw policy/LSM commands disabled");
+        }
+        if let MeshCommand::AuthorizedPolicy(a) = cmd {
+            if self.approval.is_none() {
+                return Err("Approval profile not configured");
+            }
+            let mut shape_guard = self.clone();
+            shape_guard.approval = None;
+            shape_guard.validate_log_command(&MeshCommand::SetPeerTrustLeaseBatch {
+                issued_at_unix_ns: a.issued_at_unix_ns,
+                rules: vec![a.rule.clone()],
+            })?;
+            if a.revision == 0
+                || a.signature.len() != 64
+                || a.valid_until_unix_ns <= a.issued_at_unix_ns
+                || a.valid_until_unix_ns - a.issued_at_unix_ns > 300_000_000_000
+                || (a.rule.rule.trusted
+                    && (a.rule.rule.ttl_secs != 0 || a.rule.not_after_unix_ns != 0))
+                || (!a.rule.rule.trusted && a.valid_until_unix_ns > a.rule.not_after_unix_ns)
+            {
+                return Err("Invalid operator approval bounds");
+            }
+        }
         match cmd {
             MeshCommand::SetPeerTrust {
                 peer_ip,
@@ -50,11 +85,27 @@ impl SecurityPolicyGuard {
             } if self.protected_ips.contains(peer_ip) => {
                 return Err("Policy Violation: Cannot block a protected/loopback IP address");
             }
-            MeshCommand::SetPeerTrustBatch { rules } => {
-                if rules.is_empty() || rules.len() > MAX_BATCH_RULES_PER_COMMAND {
+            MeshCommand::SetPeerTrust { trusted: false, .. } => {
+                return Err("Policy Violation: BAN requires a finite TTL and signed deadline");
+            }
+            MeshCommand::SetPeerTrustBatch { .. } | MeshCommand::SetPeerTrustLeaseBatch { .. } => {
+                let count = cmd.batch_rules().count();
+                if count == 0 || count > MAX_BATCH_RULES_PER_COMMAND {
                     return Err("Policy Violation: Batch rules count out of bounds (1..=128)");
                 }
-                for rule in rules {
+                for rule in cmd.batch_rules() {
+                    let ip = Ipv4Addr::from(rule.peer_ip);
+                    if !rule.trusted
+                        && (ip.is_loopback()
+                            || ip.is_unspecified()
+                            || ip.is_multicast()
+                            || ip.is_broadcast())
+                    {
+                        return Err("Policy Violation: Invalid or loopback BAN target");
+                    }
+                    if !rule.trusted && rule.ttl_secs == 0 {
+                        return Err("Policy Violation: BAN TTL must be positive");
+                    }
                     if !rule.trusted && self.protected_ips.contains(&rule.peer_ip) {
                         return Err(
                             "Policy Violation: Batch contains a protected/loopback IP address",
@@ -64,8 +115,40 @@ impl SecurityPolicyGuard {
                         return Err("Policy Violation: Rule TTL exceeds MAX_POLICY_TTL_SECS");
                     }
                 }
+                if let MeshCommand::SetPeerTrustLeaseBatch {
+                    issued_at_unix_ns,
+                    rules,
+                } = cmd
+                {
+                    if *issued_at_unix_ns == 0 {
+                        return Err("Policy Violation: Missing issuance timestamp");
+                    }
+                    for item in rules {
+                        let expected = if item.rule.ttl_secs == 0 {
+                            Some(0)
+                        } else {
+                            issued_at_unix_ns
+                                .checked_add(u64::from(item.rule.ttl_secs) * 1_000_000_000)
+                        };
+                        if expected != Some(item.not_after_unix_ns) {
+                            return Err("Policy Violation: Invalid absolute lease window");
+                        }
+                    }
+                }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Replicated/persisted BANs must already carry their signed absolute expiry.
+    /// Relative TTL is a local proposal input only; unban commands need no expiry.
+    pub fn validate_log_command(&self, cmd: &MeshCommand) -> Result<(), &'static str> {
+        self.validate_command(cmd)?;
+        if matches!(cmd, MeshCommand::SetPeerTrustBatch { rules }
+            if rules.iter().any(|rule| !rule.trusted))
+        {
+            return Err("Policy Violation: Legacy BAN has no signed absolute deadline");
         }
         Ok(())
     }
@@ -96,7 +179,7 @@ impl SecurityPolicyGuard {
                 return Err("Entry index discontinuity or invalid term bounds");
             }
             min_term = entry.term;
-            self.validate_command(&entry.command)?;
+            self.validate_log_command(&entry.command)?;
         }
         Ok(())
     }

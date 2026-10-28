@@ -220,8 +220,20 @@ impl TuiArenaApp {
             ]));
             let seed = [(i as u8) + 1; 32];
             let mut st = ConsensusState::new(name, peers).with_ebpf_bridge(bridge.clone());
-            st.set_crypto_identity(NodeCryptoIdentity::from_seed(name, &seed));
-            st.register_peer_public_keys(pub_keys.clone());
+            st.set_crypto_identity(NodeCryptoIdentity::from_seed(name, &seed))
+                .unwrap();
+            st.register_peer_public_keys(pub_keys.clone()).unwrap();
+            #[cfg(target_os = "linux")]
+            if self.real_kernel_bridge.is_some() {
+                // Finite leases copied to the real kernel must use its boot clock,
+                // never the deterministic simulation epoch/zero boot timestamp.
+                if let Err(error) = crate::infra::policy_clock::LinuxBootClock::new()
+                    .and_then(|clock| st.configure_policy_clock(Arc::new(clock)))
+                {
+                    st.persistence_error = Some(format!("Live arena clock unavailable: {error}"));
+                    self.log(format!("ERROR: Live arena proposals disabled: {error}"));
+                }
+            }
             self.bridges.insert(name.to_string(), bridge);
             self.nodes.insert(name.to_string(), st);
         }
@@ -237,19 +249,46 @@ impl TuiArenaApp {
     }
 
     pub fn elect_leader(&mut self, candidate: &str) {
-        let rv = self
-            .nodes
-            .get_mut(candidate)
-            .expect("candidate exists")
-            .start_election();
-        let signed_rv = self.identities[candidate].sign_rpc(rv);
-
         let peer_names: Vec<String> = self
             .nodes
             .keys()
             .filter(|k| k.as_str() != candidate)
             .cloned()
             .collect();
+        let pre = match self
+            .nodes
+            .get_mut(candidate)
+            .expect("candidate exists")
+            .start_pre_vote()
+        {
+            Ok(pre) => pre,
+            Err(error) => {
+                self.log(format!("Election refused: {error}"));
+                return;
+            }
+        };
+        for peer in &peer_names {
+            if let Ok(Some(reply)) = self
+                .nodes
+                .get_mut(peer)
+                .unwrap()
+                .handle_signed_rpc(pre.clone())
+            {
+                let signed = self.nodes[peer].sign_rpc(reply);
+                let _ = self
+                    .nodes
+                    .get_mut(candidate)
+                    .unwrap()
+                    .handle_signed_rpc(signed);
+            }
+        }
+        let signed_rv = match self.nodes.get_mut(candidate).unwrap().finish_pre_vote() {
+            Ok(Some(request)) => request,
+            _ => {
+                self.log("Election has no quorum term support");
+                return;
+            }
+        };
 
         let mut responses = Vec::new();
         for peer in peer_names {
@@ -259,7 +298,7 @@ impl TuiArenaApp {
                 .unwrap()
                 .handle_signed_rpc(signed_rv.clone())
             {
-                responses.push((peer.clone(), self.identities[&peer].sign_rpc(resp)));
+                responses.push((peer.clone(), self.nodes[&peer].sign_rpc(resp)));
             }
         }
 
@@ -271,6 +310,10 @@ impl TuiArenaApp {
                 .handle_signed_rpc(signed_resp);
         }
 
+        if self.nodes[candidate].role != crate::domain::Role::Leader {
+            self.log("Election has no durable vote quorum");
+            return;
+        }
         let term = self.nodes[candidate].current_term;
         let quorum = self.nodes[candidate].quorum_size();
         let total = self.nodes[candidate].cluster_size();
@@ -306,11 +349,13 @@ impl TuiArenaApp {
             leader_id: "node-alpha".into(),
             prev_log_index: 0,
             prev_log_term: 0,
+            prev_log_hash: [0; 32],
             entries: vec![],
             leader_commit: 0,
             commit_qc: None,
         };
-        let mut forged_env = attacker_id.sign_rpc(forged_rpc);
+        let mut forged_env =
+            attacker_id.sign_rpc(&crate::domain::SigningContext::simulation(), forged_rpc);
         forged_env.signer_id = "node-alpha".into(); // リーダーになりすまし
 
         for (name, node) in &mut self.nodes {
@@ -348,10 +393,10 @@ impl TuiArenaApp {
         for (idx, pid, ip, target_node) in active_rogues {
             self.rogues[idx].status = RogueStatus::ConsensusVoting;
 
-            // (A) リーダーが `SetPeerTrust(ip, false)` と `SetNodeLockdown(target_node, true)` を提案
+            // (A) 有限TTLのIP BANと、別命令のLSMシミュレーションを提案
             {
                 let leader = self.nodes.get_mut(&leader_id).unwrap();
-                let _ = leader.propose(MeshCommand::set_trust(ip, false));
+                let _ = leader.propose(MeshCommand::set_trust_with_ttl(ip, false, 300));
                 let _ = leader.propose(MeshCommand::set_lockdown(&target_node, true));
             }
 
@@ -371,14 +416,14 @@ impl TuiArenaApp {
                         .unwrap()
                         .make_append_entries(f_id)
                         .unwrap();
-                    let signed_ae = self.identities[&leader_id].sign_rpc(ae);
+                    let signed_ae = self.nodes[&leader_id].sign_rpc(ae);
                     if let Ok(Some(resp)) = self
                         .nodes
                         .get_mut(f_id)
                         .unwrap()
                         .handle_signed_rpc(signed_ae)
                     {
-                        let signed_resp = self.identities[f_id].sign_rpc(resp);
+                        let signed_resp = self.nodes[f_id].sign_rpc(resp);
                         let _ = self
                             .nodes
                             .get_mut(&leader_id)
@@ -418,6 +463,11 @@ impl TuiArenaApp {
     /// 定期ティック更新（攻撃プロセスのパケット送信と eBPF XDP フィルタ判定のカウント）
     pub fn on_tick(&mut self) {
         self.step_tick += 1;
+        if self.real_kernel_bridge.is_some() {
+            for state in self.nodes.values_mut() {
+                state.retry_pending_apply();
+            }
+        }
 
         if let Some(ref real_bridge) = self.real_kernel_bridge {
             if let Some((pass_cnt, drop_cnt)) = real_bridge.read_xdp_counters() {

@@ -9,7 +9,8 @@ use aya_ebpf::{
 };
 use core::mem;
 use veil_common::{
-    evaluate_lsm_policy, evaluate_peer_policy, NodeLsmPolicy, PeerPolicy, XdpVerdict,
+    evaluate_lsm_policy, evaluate_peer_policy_at, NodeLsmPolicy, PeerPolicy, ServiceScopeKey,
+    XdpVerdict,
 };
 
 /// IPv4 アドレス (Host Byte Order `u32`) をキーとするピア信頼ポリシーマップ
@@ -23,6 +24,12 @@ static LSM_POLICY_MAP: Array<NodeLsmPolicy> = Array::with_max_entries(1, 0);
 /// XDP で処理したパケット数のカウンタ (`index 0`: PASS, `index 1`: DROP)
 #[map]
 static PACKETS_SEEN_MAP: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
+
+#[map]
+static XDP_CONTROL: Array<u32> = Array::with_max_entries(1, 0);
+
+#[map]
+static SERVICE_SCOPE: HashMap<ServiceScopeKey, u8> = HashMap::with_max_entries(16, 0);
 
 const ETH_P_IP: u16 = 0x0800;
 
@@ -69,17 +76,49 @@ pub fn veil_xdp_filter(ctx: XdpContext) -> u32 {
 }
 
 fn try_veil_xdp_filter(ctx: XdpContext) -> Result<u32, ()> {
-    let eth = unsafe { *ptr_at::<EthHdr>(&ctx, 0)? };
+    if XDP_CONTROL.get(0).copied() != Some(1) {
+        if let Some(pass_cnt) = PACKETS_SEEN_MAP.get_ptr_mut(0) {
+            unsafe { *pass_cnt += 1 };
+        }
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let eth = unsafe { core::ptr::read_unaligned(ptr_at::<EthHdr>(&ctx, 0)?) };
     if u16::from_be(eth.h_proto) != ETH_P_IP {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let ipv4 = unsafe { *ptr_at::<Ipv4Hdr>(&ctx, mem::size_of::<EthHdr>())? };
+    // Ethernet is 14 bytes; the IPv4 header need not be aligned for Ipv4Hdr.
+    let ipv4 =
+        unsafe { core::ptr::read_unaligned(ptr_at::<Ipv4Hdr>(&ctx, mem::size_of::<EthHdr>())?) };
+    let ihl = usize::from(ipv4.version_ihl & 0x0f) * 4;
+    if ihl < 20 || ctx.data() + mem::size_of::<EthHdr>() + ihl > ctx.data_end() {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    if ipv4.version_ihl >> 4 != 4 || u16::from_be(ipv4.frag_off) & 0x3fff != 0 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let port = if ipv4.protocol == 6 || ipv4.protocol == 17 {
+        let p = ptr_at::<u16>(&ctx, mem::size_of::<EthHdr>() + ihl + 2)?;
+        u16::from_be(unsafe { core::ptr::read_unaligned(p) })
+    } else {
+        0
+    };
+    let scope = ServiceScopeKey {
+        destination: u32::from_be(ipv4.daddr),
+        protocol: u16::from(ipv4.protocol),
+        port,
+    };
+    if unsafe { SERVICE_SCOPE.get(&scope) }.is_none() {
+        return Ok(xdp_action::XDP_PASS);
+    }
     let src_ip = u32::from_be(ipv4.saddr);
 
     // マップにポリシーが登録されており、trusted == 0 (Untrusted) の場合は XDP_DROP
     let policy = unsafe { PEER_POLICY_MAP.get(&src_ip) };
-    if evaluate_peer_policy(policy) == XdpVerdict::Drop {
+    if evaluate_peer_policy_at(policy, unsafe {
+        aya_ebpf::helpers::bpf_ktime_get_boot_ns()
+    }) == XdpVerdict::Drop
+    {
         if let Some(drop_cnt) = PACKETS_SEEN_MAP.get_ptr_mut(1) {
             unsafe { *drop_cnt += 1 };
         }

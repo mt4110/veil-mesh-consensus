@@ -1,0 +1,24 @@
+[Unit]
+Description=Restore the fixed isolated local BAN test namespace
+After=network.target NetworkManager.service
+Before=veil-local-ban-pi-boot.service
+RequiresMountsFor=/opt/veil-local-ban-pi-boot
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -I -B /opt/veil-local-ban-pi-boot/namespace.py restore --apply
+Restart=no
+TimeoutStartSec=10s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+TasksMax=16
+MemoryMax=64M
+# No filesystem/mount namespace sandbox: ip netns bind mounts must be visible
+# to the host service manager. This fixed root helper exposes no RPC or input.
+# No ExecStop deletion; retain the namespace and links after stopping the test.
+
+[Install]
+WantedBy=multi-user.target
